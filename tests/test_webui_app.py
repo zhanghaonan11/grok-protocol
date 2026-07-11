@@ -43,6 +43,10 @@ class WebUIAppTests(unittest.TestCase):
             self.assertEqual(body["count"], 2)
             self.assertEqual(body["config"]["turnstile_api_key"], "***")
             self.assertEqual(body["config"]["yyds_api_key"], "***")
+            center = client.get("/api/config-center").json()
+            # config-center intentionally exposes plaintext keys for local editing
+            self.assertEqual(center["fields"]["yyds_api_key"], "secret-key")
+            self.assertEqual(center["fields"]["turnstile_api_key"], "CAP-SECRET")
 
     def test_start_run_conflict(self):
         with tempfile.TemporaryDirectory() as d:

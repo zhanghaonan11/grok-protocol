@@ -128,7 +128,7 @@ class ConfigCenterTests(unittest.TestCase):
             service = svc.BatchService(config_path=cfg, root_dir=root)
             data = service.get_config_center()
             self.assertTrue(data["secret_flags"]["yyds_api_key"])
-            self.assertEqual(data["fields"]["yyds_api_key"], "***")
+            self.assertEqual(data["fields"]["yyds_api_key"], "secret-yyds")
             self.assertEqual(data["fields"]["proxy_mode"], "none")
             self.assertEqual(data["proxy_pool"]["line_count"], 1)
 

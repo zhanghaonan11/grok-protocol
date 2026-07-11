@@ -21,7 +21,7 @@ async function api(path, opts={}) {
 
 function setFlag(key, hasValue) {
   const el = document.querySelector(`[data-flag="${key}"]`);
-  if (el) el.textContent = hasValue ? "已配置（留空=不改，输入新值=覆盖）" : "未配置";
+  if (el) el.textContent = hasValue ? "已从配置文件加载（可直接改，清空后保存=删除）" : "未配置";
 }
 
 function fill(data) {
@@ -35,14 +35,14 @@ function fill(data) {
   };
   set("email_provider", f.email_provider || "yyds");
   set("yyds_api_base", f.yyds_api_base || "");
-  set("yyds_api_key", "");
-  set("yyds_jwt", "");
+  set("yyds_api_key", f.yyds_api_key || "");
+  set("yyds_jwt", f.yyds_jwt || "");
   set("turnstile_provider", f.turnstile_provider || "local");
-  set("turnstile_api_key", "");
+  set("turnstile_api_key", f.turnstile_api_key || "");
   set("turnstile_headless", !!f.turnstile_headless, true);
   set("cloudflare_api_base", f.cloudflare_api_base || "");
-  set("cloudflare_api_key", "");
-  set("duckmail_api_key", "");
+  set("cloudflare_api_key", f.cloudflare_api_key || "");
+  set("duckmail_api_key", f.duckmail_api_key || "");
   set("ms_mail_file", f.ms_mail_file || "");
   set("proxy_mode", f.proxy_mode || "auto");
   set("proxy", f.proxy || "");
@@ -53,11 +53,11 @@ function fill(data) {
   set("proxy_rotate_session", !!f.proxy_rotate_session, true);
   set("xai_oauth_output_dir", f.xai_oauth_output_dir || "");
   set("grok2api_remote_base", f.grok2api_remote_base || "");
-  set("grok2api_remote_app_key", "");
+  set("grok2api_remote_app_key", f.grok2api_remote_app_key || "");
   set("grok2api_pool_name", f.grok2api_pool_name || "");
 
   ["yyds_api_key","yyds_jwt","turnstile_api_key","cloudflare_api_key","duckmail_api_key","grok2api_remote_app_key"]
-    .forEach(k => setFlag(k, !!flags[k]));
+    .forEach(k => setFlag(k, !!flags[k] || !!(f[k] && String(f[k]).trim())));
 
   const pool = data.proxy_pool || {};
   $("proxyPoolText").value = pool.text || "";

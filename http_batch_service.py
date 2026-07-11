@@ -1374,14 +1374,16 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
         "fields": {
             "email_provider": str(raw.get("email_provider") or ""),
             "yyds_api_base": str(raw.get("yyds_api_base") or ""),
-            "yyds_api_key": "***" if secret_flags.get("yyds_api_key") else "",
-            "yyds_jwt": "***" if secret_flags.get("yyds_jwt") else "",
+            # Local-only config center intentionally returns plaintext secrets so
+            # operators can inspect values already stored in config.json.
+            "yyds_api_key": str(raw.get("yyds_api_key") or ""),
+            "yyds_jwt": str(raw.get("yyds_jwt") or ""),
             "turnstile_provider": settings.turnstile_provider,
-            "turnstile_api_key": "***" if secret_flags.get("turnstile_api_key") else "",
+            "turnstile_api_key": str(raw.get("turnstile_api_key") or ""),
             "turnstile_headless": bool(settings.turnstile_headless),
-            "duckmail_api_key": "***" if secret_flags.get("duckmail_api_key") else "",
+            "duckmail_api_key": str(raw.get("duckmail_api_key") or ""),
             "cloudflare_api_base": str(raw.get("cloudflare_api_base") or ""),
-            "cloudflare_api_key": "***" if secret_flags.get("cloudflare_api_key") else "",
+            "cloudflare_api_key": str(raw.get("cloudflare_api_key") or ""),
             "cloudflare_auth_mode": str(raw.get("cloudflare_auth_mode") or "none"),
             "ms_mail_file": str(raw.get("ms_mail_file") or ""),
             "proxy_mode": "none" if settings.no_proxy else str(settings.proxy_mode or "auto"),
@@ -1393,7 +1395,7 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
             "local_proxy_port": int(raw.get("local_proxy_port") or 17890),
             "xai_oauth_output_dir": str(settings.output_dir),
             "grok2api_remote_base": str(raw.get("grok2api_remote_base") or ""),
-            "grok2api_remote_app_key": "***" if secret_flags.get("grok2api_remote_app_key") else "",
+            "grok2api_remote_app_key": str(raw.get("grok2api_remote_app_key") or ""),
             "grok2api_pool_name": str(raw.get("grok2api_pool_name") or ""),
             "grok2api_auto_add_local": _as_bool(raw.get("grok2api_auto_add_local")),
             "grok2api_auto_add_remote": _as_bool(raw.get("grok2api_auto_add_remote")),
@@ -1572,7 +1574,10 @@ class BatchService:
                 default=int(cfg.get("local_proxy_port") or 17890),
             )
 
-        # Secrets: keep existing when UI sends *** or omit-empty keep.
+        # Secrets from config-center are plaintext-editable.
+        # - non-empty value: overwrite
+        # - "***": keep existing (compat)
+        # - empty string: clear
         for key in SENSITIVE_CONFIG_KEYS:
             if key not in fields:
                 continue
@@ -1580,11 +1585,7 @@ class BatchService:
             if value is None:
                 continue
             text_value = str(value)
-            if text_value.strip() in {"", "***"}:
-                # empty means clear only if explicit clear_secrets contains key
-                clear_list = data.get("clear_secrets") or fields.get("clear_secrets") or []
-                if isinstance(clear_list, list) and key in clear_list:
-                    cfg[key] = ""
+            if text_value.strip() == "***":
                 continue
             cfg[key] = text_value.strip()
 
