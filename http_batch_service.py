@@ -21,7 +21,7 @@ import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -704,6 +704,42 @@ def describe_plan(plan: RunPlan, *, dry_run: bool = False) -> str:
     return "\n".join(lines)
 
 
+
+FAILURE_CATEGORIES = (
+    "yyds_rate_limit",
+    "turnstile_hard_block",
+    "turnstile_timeout",
+    "browser_launch_failed",
+    "sso_convert_failed",
+    "register_failed",
+    "unknown",
+)
+
+
+def classify_failure_text(text: str) -> str:
+    """Map worker log / last_log text into a coarse failure bucket."""
+    raw = str(text or "")
+    t = raw.lower()
+    if ("yyds" in t or "too many account creation" in t) and ("429" in t or "too many" in t):
+        return "yyds_rate_limit"
+    if "cloudflare_hard_block" in t or "hard_block" in t or "硬拦截" in raw:
+        return "turnstile_hard_block"
+    if "turnstile" in t and ("timeout" in t or "超时" in raw):
+        return "turnstile_timeout"
+    if (
+        "无法启动浏览器" in raw
+        or "browser" in t and "launch" in t
+        or "maximum number of clients" in t
+        or ("x11" in t and "client" in t)
+    ):
+        return "browser_launch_failed"
+    if "sso" in t and ("转换失败" in raw or "convert" in t or "退出码" in raw or "无法做 sso" in t):
+        return "sso_convert_failed"
+    if ("注册" in raw and "失败" in raw) or "register" in t and "fail" in t:
+        return "register_failed"
+    return "unknown"
+
+
 class BatchRunner:
     """调度 HTTP 协议子进程，并把每一行输出流式送到 TUI。"""
 
@@ -720,6 +756,8 @@ class BatchRunner:
         self.next_index = 0
         self.summary_path: Optional[Path] = None
         self.account_count = 0
+        self.failure_counts: Dict[str, int] = {key: 0 for key in FAILURE_CATEGORIES}
+        self._failure_recorded: set[int] = set()
 
     @property
     def active(self) -> List[WorkerState]:
@@ -1009,6 +1047,8 @@ class BatchRunner:
                 else:
                     worker.status = "succeeded" if ok else "failed"
                 worker.last_log = msg
+                if worker.status == "failed":
+                    self._record_failure(worker, msg)
                 self._log(f"W{worker_index:02d}", worker.last_log)
                 continue
             worker.last_log = _safe_text(raw)
@@ -1037,6 +1077,7 @@ class BatchRunner:
             else:
                 worker.status = "failed"
                 worker.last_log = f"协议任务退出，退出码 {return_code}"
+                self._record_failure(worker, worker.last_log)
                 self._log(f"W{worker.index:02d}", worker.last_log)
 
     def _finalize(self) -> None:
@@ -1062,6 +1103,7 @@ class BatchRunner:
             self.summary_path = summary
             self.account_count = len(lines)
         self.done = True
+        self._write_summary_json()
         self._log(
             "SYSTEM",
             f"批量完成: 成功={self.succeeded}, 失败={self.failed}, 账号数={self.account_count}",
@@ -1097,7 +1139,326 @@ class BatchRunner:
                 worker.last_log = "停止中：等待当前 SSO 转换收尾"
                 self._log(f"W{worker.index:02d}", worker.last_log)
 
+
+    def _record_failure(self, worker: WorkerState, reason_text: str = "") -> None:
+        if worker.index in self._failure_recorded:
+            return
+        blob_parts = [reason_text, worker.last_log]
+        if worker.log_path and worker.log_path.is_file():
+            try:
+                blob_parts.append(worker.log_path.read_text(encoding="utf-8", errors="replace")[-4000:])
+            except OSError:
+                pass
+        category = classify_failure_text("\n".join(str(p) for p in blob_parts if p))
+        self.failure_counts[category] = int(self.failure_counts.get(category) or 0) + 1
+        self._failure_recorded.add(worker.index)
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "run_id": self.run_id,
+            "started": self.started,
+            "done": self.done,
+            "stopping": self.stopping,
+            "count": len(self.workers),
+            "completed": self.completed,
+            "succeeded": self.succeeded,
+            "failed": self.failed,
+            "active": len(self.active),
+            "account_count": self.account_count,
+            "failure_counts": dict(self.failure_counts),
+            "warnings": list(self.plan.warnings),
+            "run_dir": str(self.run_dir),
+            "summary_path": str(self.summary_path) if self.summary_path else "",
+            "workers": [
+                {
+                    "index": worker.index,
+                    "status": worker.status,
+                    "last_log": worker.last_log,
+                    "return_code": worker.return_code,
+                }
+                for worker in self.workers
+            ],
+        }
+
+    def _write_summary_json(self) -> None:
+        payload = self.snapshot()
+        target = self.run_dir / "summary.json"
+        try:
+            target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            self._log("SYSTEM", f"无法写入 summary.json: {exc}")
+
     def exit_code(self) -> int:
         return 0 if self.done and self.failed == 0 else 2
 
+
+class BatchBusyError(TuiConfigError):
+    """Raised when a second batch is requested while one is still active."""
+
+
+def list_runs(runs_dir: Path = RUNS_DIR, *, limit: int = 50) -> List[Dict[str, object]]:
+    root = Path(runs_dir)
+    if not root.is_dir():
+        return []
+    entries: List[Tuple[float, Path]] = []
+    for path in root.iterdir():
+        if path.is_dir():
+            try:
+                entries.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+    entries.sort(key=lambda item: item[0], reverse=True)
+    result: List[Dict[str, object]] = []
+    for _, path in entries[: max(1, int(limit or 50))]:
+        detail = _run_summary_from_dir(path)
+        result.append(detail)
+    return result
+
+
+def _run_summary_from_dir(run_dir: Path) -> Dict[str, object]:
+    summary_path = run_dir / "summary.json"
+    if summary_path.is_file():
+        try:
+            data = json.loads(summary_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data.setdefault("run_id", run_dir.name)
+                data.setdefault("run_dir", str(run_dir))
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+    workers = sorted(run_dir.glob("worker_*.log"))
+    accounts = list(run_dir.glob("accounts_*.txt"))
+    return {
+        "run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "done": True,
+        "count": len(workers),
+        "succeeded": len(accounts),
+        "failed": max(0, len(workers) - len(accounts)),
+        "account_count": len(accounts),
+        "failure_counts": {},
+        "workers": [],
+    }
+
+
+def get_run_detail(run_id: str, runs_dir: Path = RUNS_DIR) -> Dict[str, object]:
+    run_dir = Path(runs_dir) / str(run_id)
+    if not run_dir.is_dir():
+        raise TuiConfigError(f"找不到运行记录: {run_id}")
+    detail = _run_summary_from_dir(run_dir)
+    files = []
+    for path in sorted(run_dir.iterdir()):
+        if path.is_file():
+            files.append({"name": path.name, "size": path.stat().st_size})
+    detail["files"] = files
+    return detail
+
+
+def resolve_run_file(run_id: str, rel_path: str, runs_dir: Path = RUNS_DIR) -> Path:
+    run_dir = (Path(runs_dir) / str(run_id)).resolve()
+    if not run_dir.is_dir():
+        raise TuiConfigError(f"找不到运行记录: {run_id}")
+    candidate = (run_dir / str(rel_path)).resolve()
+    try:
+        candidate.relative_to(run_dir)
+    except ValueError as exc:
+        raise TuiConfigError("非法文件路径") from exc
+    if not candidate.is_file():
+        raise TuiConfigError(f"文件不存在: {rel_path}")
+    return candidate
+
+
+def _settings_to_public_dict(settings: Settings) -> Dict[str, object]:
+    config = dict(settings.config or {})
+    sensitive = {
+        "turnstile_api_key",
+        "yyds_api_key",
+        "yyds_jwt",
+        "duckmail_api_key",
+        "cloudflare_api_key",
+        "grok2api_remote_app_key",
+    }
+    for key in sensitive:
+        if key in config and str(config.get(key) or "").strip():
+            config[key] = "***"
+    return {
+        "config_path": str(settings.config_path),
+        "count": settings.count,
+        "workers": settings.workers,
+        "output_dir": str(settings.output_dir),
+        "run_mode": settings.run_mode,
+        "proxy_mode": settings.proxy_mode,
+        "no_proxy": settings.no_proxy,
+        "turnstile_provider": settings.turnstile_provider,
+        "turnstile_headless": settings.turnstile_headless,
+        "sso_convert_retries": settings.sso_convert_retries,
+        "sso_convert_cooldown": settings.sso_convert_cooldown,
+        "email_provider": str(config.get("email_provider") or ""),
+        "config": config,
+    }
+
+
+class BatchService:
+    """Process-local single-batch controller for WebUI (and other UIs)."""
+
+    def __init__(
+        self,
+        *,
+        config_path: Optional[Path] = None,
+        root_dir: Optional[Path] = None,
+    ) -> None:
+        self.root_dir = Path(root_dir or ROOT_DIR)
+        self.config_path = Path(config_path or (self.root_dir / "config.json"))
+        self.settings = self._load_settings()
+        self._runner: Optional[BatchRunner] = None
+        self._listeners: List[Callable[[str], None]] = []
+        self._log_cursor = 0
+        self._lock = threading.Lock()
+
+    def _load_settings(self) -> Settings:
+        config = _read_config(self.config_path) if self.config_path.is_file() else {}
+        settings = Settings(
+            config_path=self.config_path,
+            count=_positive_int(config.get("register_count", 1), "注册数量", MAX_COUNT),
+            workers=_positive_int(config.get("concurrent_workers", 1), "并发数", MAX_WORKERS),
+            output_dir=_absolute_path(str(config.get("xai_oauth_output_dir") or DEFAULT_OUTPUT_DIR), self.root_dir),
+            run_mode=_normalize_run_mode(config.get("tui_run_mode") or DEFAULT_RUN_MODE),
+            proxy_mode=str(config.get("tui_proxy_mode") or "auto"),
+            no_proxy=False,
+            turnstile_provider=_normalize_turnstile_provider(config.get("turnstile_provider") or "capsolver"),
+            turnstile_headless=_as_bool(config.get("turnstile_headless")),
+            sso_convert_retries=_bounded_int(
+                config.get("tui_sso_convert_retries"),
+                "SSO转换重试",
+                minimum=1,
+                maximum=MAX_SSO_CONVERT_RETRIES,
+                default=DEFAULT_SSO_CONVERT_RETRIES,
+            ),
+            sso_convert_cooldown=_bounded_int(
+                config.get("tui_sso_convert_cooldown"),
+                "SSO转换冷却",
+                minimum=0,
+                maximum=MAX_SSO_CONVERT_COOLDOWN,
+                default=DEFAULT_SSO_CONVERT_COOLDOWN,
+            ),
+            config=config,
+        )
+        return settings
+
+    def get_settings(self) -> Settings:
+        return self.settings
+
+    def public_settings(self) -> Dict[str, object]:
+        return _settings_to_public_dict(self.settings)
+
+    def reload_settings(self) -> Settings:
+        self.settings = self._load_settings()
+        return self.settings
+
+    def update_settings_from_mapping(self, data: Dict[str, object], *, persist: bool) -> Settings:
+        data = dict(data or {})
+        if "count" in data:
+            self.settings.count = _positive_int(data.get("count"), "注册数量", MAX_COUNT)
+        if "workers" in data:
+            self.settings.workers = _positive_int(data.get("workers"), "并发数", MAX_WORKERS)
+        if "output_dir" in data and str(data.get("output_dir") or "").strip():
+            self.settings.output_dir = _absolute_path(str(data.get("output_dir")), self.root_dir)
+        if "run_mode" in data:
+            self.settings.run_mode = _normalize_run_mode(data.get("run_mode"))
+        if "proxy_mode" in data:
+            self.settings.proxy_mode = str(data.get("proxy_mode") or "auto")
+        if "turnstile_provider" in data:
+            self.settings.turnstile_provider = _normalize_turnstile_provider(data.get("turnstile_provider"))
+        if "turnstile_headless" in data:
+            self.settings.turnstile_headless = _as_bool(data.get("turnstile_headless"))
+        if "sso_convert_retries" in data:
+            self.settings.sso_convert_retries = _bounded_int(
+                data.get("sso_convert_retries"),
+                "SSO转换重试",
+                minimum=1,
+                maximum=MAX_SSO_CONVERT_RETRIES,
+                default=DEFAULT_SSO_CONVERT_RETRIES,
+            )
+        if "sso_convert_cooldown" in data:
+            self.settings.sso_convert_cooldown = _bounded_int(
+                data.get("sso_convert_cooldown"),
+                "SSO转换冷却",
+                minimum=0,
+                maximum=MAX_SSO_CONVERT_COOLDOWN,
+                default=DEFAULT_SSO_CONVERT_COOLDOWN,
+            )
+        # Optional nested config keys (non-secret runtime toggles only unless persist raw provided)
+        cfg_patch = data.get("config")
+        if isinstance(cfg_patch, dict):
+            merged = dict(self.settings.config or {})
+            for key, value in cfg_patch.items():
+                if str(value) == "***":
+                    continue
+                merged[key] = value
+            self.settings.config = merged
+        if persist:
+            persist_settings(self.settings)
+            # re-read to keep memory aligned with disk
+            self.settings.config = _read_config(self.settings.config_path)
+        return self.settings
+
+    def attach_log_listener(self, callback: Callable[[str], None]) -> None:
+        self._listeners.append(callback)
+
+    def _emit_log(self, line: str) -> None:
+        for callback in list(self._listeners):
+            try:
+                callback(line)
+            except Exception:
+                pass
+
+    def _sync_logs(self) -> None:
+        runner = self._runner
+        if runner is None:
+            return
+        logs = list(runner.logs)
+        if self._log_cursor > len(logs):
+            self._log_cursor = 0
+        while self._log_cursor < len(logs):
+            self._emit_log(logs[self._log_cursor])
+            self._log_cursor += 1
+
+    def is_busy(self) -> bool:
+        runner = self._runner
+        return bool(runner is not None and runner.started and not runner.done)
+
+    def start_run(self, overrides: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+        with self._lock:
+            if self.is_busy():
+                raise BatchBusyError("当前已有批次在运行")
+            if overrides:
+                self.update_settings_from_mapping(overrides, persist=False)
+            plan = build_plan(self.settings)
+            runner = BatchRunner(plan)
+            self._runner = runner
+            self._log_cursor = 0
+            runner.start()
+            self._sync_logs()
+            return runner.snapshot()
+
+    def stop_run(self) -> Dict[str, object]:
+        with self._lock:
+            if self._runner is None:
+                raise TuiConfigError("当前没有运行中的批次")
+            self._runner.stop()
+            self._runner.tick()
+            self._sync_logs()
+            return self._runner.snapshot()
+
+    def current_snapshot(self) -> Optional[Dict[str, object]]:
+        if self._runner is None:
+            return None
+        return self._runner.snapshot()
+
+    def poll(self) -> None:
+        runner = self._runner
+        if runner is None:
+            return
+        runner.tick()
+        self._sync_logs()
 
