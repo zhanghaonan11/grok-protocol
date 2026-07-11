@@ -46,6 +46,7 @@ except ImportError:
 from pathlib import Path
 import string
 import json
+import tempfile
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
@@ -1453,21 +1454,66 @@ def yyds_generate_username(length=10):
     return "".join(secrets.choice(chars) for _ in range(length))
 
 
+
+_YYDS_DOMAIN_RR_LOCK = Path(tempfile.gettempdir()) / "xai-yyds-domain-rr.lock"
+_YYDS_DOMAIN_RR_STATE = Path(tempfile.gettempdir()) / "xai-yyds-domain-rr-state.json"
+
+
+def _yyds_next_domain_rr(domains):
+    cleaned = [str(d).strip() for d in domains if str(d or "").strip()]
+    if not cleaned:
+        raise Exception("YYDS 域名池为空")
+    if len(cleaned) == 1:
+        return cleaned[0]
+    _YYDS_DOMAIN_RR_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(_YYDS_DOMAIN_RR_LOCK, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            idx = 0
+            try:
+                raw = _YYDS_DOMAIN_RR_STATE.read_text(encoding="utf-8").strip()
+                if raw:
+                    idx = int(json.loads(raw).get("index") or 0)
+            except Exception:
+                idx = 0
+            if idx < 0:
+                idx = 0
+            pick = cleaned[idx % len(cleaned)]
+            _YYDS_DOMAIN_RR_STATE.write_text(
+                json.dumps({"index": idx + 1}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            return pick
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def yyds_pick_domain(api_key=None, jwt=None):
     domains = yyds_get_domains(api_key=api_key, jwt=jwt)
     if not domains:
-        raise Exception("YYDS 娌℃湁杩斿洖浠讳綍鍙敤鍩熷悕")
+        raise Exception("YYDS 没有返回任何可用域名")
     private = [d for d in domains if d.get("isVerified") and not d.get("isPublic")]
-    if private:
-        return private[0]["domain"]
     public = [d for d in domains if d.get("isVerified") and d.get("isPublic")]
-    if public:
-        return public[0]["domain"]
     verified = [d for d in domains if d.get("isVerified")]
-    if verified:
-        return verified[0]["domain"]
-    raise Exception("YYDS 鏃犲凡楠岃瘉鍩熷悕鍙敤")
-
+    pool = []
+    for group in (private, public, verified, domains):
+        names = []
+        seen = set()
+        for item in group:
+            domain = str(item.get("domain") or "").strip()
+            if not domain:
+                continue
+            key = domain.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(domain)
+        if names:
+            pool = names
+            break
+    if not pool:
+        raise Exception("YYDS 无已验证域名可用")
+    return _yyds_next_domain_rr(pool)
 
 def yyds_get_email_and_token(api_key=None, jwt=None):
     key = api_key or get_yyds_api_key()

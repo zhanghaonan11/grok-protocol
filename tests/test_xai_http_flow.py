@@ -646,6 +646,112 @@ class XAIHttpFlowTests(unittest.TestCase):
         self.assertFalse(use_headless)
 
 
+
+    def test_yyds_domain_round_robin_across_creates(self):
+        class FakeResp:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self.text = json.dumps(payload)
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        domains = [
+            {"domain": "a.example", "isVerified": True, "isPublic": False},
+            {"domain": "b.example", "isVerified": True, "isPublic": False},
+            {"domain": "c.example", "isVerified": True, "isPublic": False},
+        ]
+        seen = []
+
+        class FakeSession:
+            def get(self, url, **kwargs):
+                return FakeResp(200, {"success": True, "data": domains})
+
+            def post(self, url, **kwargs):
+                if "accounts" in url:
+                    domain = kwargs.get("json", {}).get("domain")
+                    seen.append(domain)
+                    return FakeResp(
+                        200,
+                        {
+                            "success": True,
+                            "data": {
+                                "address": f"xai@{domain}",
+                                "token": f"tok-{len(seen)}",
+                            },
+                        },
+                    )
+                return FakeResp(200, {"success": True, "data": {"token": "tok"}})
+
+        with tempfile.TemporaryDirectory() as directory:
+            rr_lock = Path(directory) / "rr.lock"
+            rr_state = Path(directory) / "rr-state.json"
+            box = flow.YydsTempMailbox({"yyds_api_key": "k"}, timeout=10)
+            box.session = FakeSession()
+            with mock.patch.object(flow, "_YYDS_DOMAIN_RR_LOCK_PATH", rr_lock), mock.patch.object(
+                flow, "_YYDS_DOMAIN_RR_STATE_PATH", rr_state
+            ), mock.patch.object(flow, "_yyds_create_spacing_sec", return_value=0.0), mock.patch.object(
+                flow.time, "sleep"
+            ):
+                for _ in range(5):
+                    box.create()
+        self.assertEqual(seen, ["a.example", "b.example", "c.example", "a.example", "b.example"])
+
+    def test_yyds_domain_whitelist_round_robin(self):
+        class FakeResp:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self.text = json.dumps(payload)
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        domains = [
+            {"domain": "lios.edu.kg", "isVerified": True, "isPublic": False},
+            {"domain": "lyf36mk1.cn", "isVerified": True, "isPublic": False},
+            {"domain": "lyan97d11.cn", "isVerified": True, "isPublic": False},
+        ]
+        seen = []
+
+        class FakeSession:
+            def get(self, url, **kwargs):
+                return FakeResp(200, {"success": True, "data": domains})
+
+            def post(self, url, **kwargs):
+                if "accounts" in url:
+                    domain = kwargs.get("json", {}).get("domain")
+                    seen.append(domain)
+                    return FakeResp(
+                        200,
+                        {"success": True, "data": {"address": f"xai@{domain}", "token": "t"}},
+                    )
+                return FakeResp(200, {"success": True, "data": {"token": "t"}})
+
+        with tempfile.TemporaryDirectory() as directory:
+            rr_lock = Path(directory) / "rr.lock"
+            rr_state = Path(directory) / "rr-state.json"
+            box = flow.YydsTempMailbox(
+                {
+                    "yyds_api_key": "k",
+                    "yyds_domains": "lyan97d11.cn,lyf36mk1.cn",
+                },
+                timeout=10,
+            )
+            box.session = FakeSession()
+            with mock.patch.object(flow, "_YYDS_DOMAIN_RR_LOCK_PATH", rr_lock), mock.patch.object(
+                flow, "_YYDS_DOMAIN_RR_STATE_PATH", rr_state
+            ), mock.patch.object(flow, "_yyds_create_spacing_sec", return_value=0.0), mock.patch.object(
+                flow.time, "sleep"
+            ):
+                for _ in range(4):
+                    box.create()
+        self.assertEqual(
+            seen,
+            ["lyan97d11.cn", "lyf36mk1.cn", "lyan97d11.cn", "lyf36mk1.cn"],
+        )
+
     def test_yyds_create_retries_on_429(self):
         calls = {"n": 0}
 

@@ -2660,6 +2660,14 @@ _YYDS_CREATE_STATE_PATH = Path(
     os.environ.get("XAI_YYDS_CREATE_STATE_PATH")
     or (Path(tempfile.gettempdir()) / "xai-yyds-create-state.json")
 )
+_YYDS_DOMAIN_RR_LOCK_PATH = Path(
+    os.environ.get("XAI_YYDS_DOMAIN_RR_LOCK_PATH")
+    or (Path(tempfile.gettempdir()) / "xai-yyds-domain-rr.lock")
+)
+_YYDS_DOMAIN_RR_STATE_PATH = Path(
+    os.environ.get("XAI_YYDS_DOMAIN_RR_STATE_PATH")
+    or (Path(tempfile.gettempdir()) / "xai-yyds-domain-rr-state.json")
+)
 
 
 DEFAULT_YYDS_CREATE_SPACING_SEC = 1.5
@@ -2803,6 +2811,99 @@ def _yyds_create_guard(*, spacing_sec: Optional[float] = None, config: Optional[
 DEFAULT_YYDS_API_BASE = "https://maliapi.215.im/v1"
 
 
+def _yyds_normalize_domain_list(raw: Any) -> List[str]:
+    """Accept list/tuple/csv/string and return unique domains preserving order."""
+    items: List[str] = []
+    if raw is None:
+        return items
+    if isinstance(raw, (list, tuple, set)):
+        seq = [str(x) for x in raw]
+    else:
+        text_value = str(raw or "").strip()
+        if not text_value:
+            return items
+        seq = []
+        for part in text_value.replace("\n", ",").replace(";", ",").split(","):
+            part = part.strip()
+            if part:
+                seq.append(part)
+    seen = set()
+    for item in seq:
+        domain = str(item or "").strip().lower().lstrip("@")
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        items.append(domain)
+    return items
+
+
+@contextmanager
+def _yyds_domain_rr_lock():
+    lock_path = _YYDS_DOMAIN_RR_LOCK_PATH
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield handle
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+def _yyds_read_domain_rr_index() -> int:
+    path = _YYDS_DOMAIN_RR_STATE_PATH
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return 0
+        data = json.loads(raw)
+        return int(data.get("index") or 0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return 0
+
+
+def _yyds_write_domain_rr_index(index: int) -> None:
+    path = _YYDS_DOMAIN_RR_STATE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"index": int(index), "updated_at": time.time()}, ensure_ascii=False)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            path.write_text(payload, encoding="utf-8")
+        except OSError:
+            pass
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def _yyds_next_round_robin_domain(domains: List[str]) -> str:
+    """Pick next domain from list with cross-process round-robin state."""
+    cleaned = [str(d or "").strip() for d in domains if str(d or "").strip()]
+    if not cleaned:
+        raise MailboxError("YYDS 域名池为空")
+    if len(cleaned) == 1:
+        return cleaned[0]
+    with _yyds_domain_rr_lock():
+        idx = _yyds_read_domain_rr_index()
+        if idx < 0:
+            idx = 0
+        pick = cleaned[idx % len(cleaned)]
+        _yyds_write_domain_rr_index(idx + 1)
+        return pick
+
+
 class YydsTempMailbox:
     """Adapter for the YYDS temporary-mail HTTP API used by the browser flow."""
 
@@ -2857,25 +2958,84 @@ class YydsTempMailbox:
             return [item for item in raw if isinstance(item, dict)]
         return []
 
-    def _pick_domain(self) -> str:
-        domains = self._domains()
-        if not domains:
+    def _domain_candidates(self) -> List[str]:
+        """Build ordered domain pool, then callers round-robin over it.
+
+        Priority group:
+          1) verified private
+          2) verified public
+          3) verified any
+          4) all returned domains
+        Optional config.yyds_domains / yyds_domain_whitelist filters the pool.
+        """
+        rows = self._domains()
+        if not rows:
             raise MailboxError("YYDS 没有返回任何可用域名")
-        private = [d for d in domains if d.get("isVerified") and not d.get("isPublic")]
-        public = [d for d in domains if d.get("isVerified") and d.get("isPublic")]
-        verified = [d for d in domains if d.get("isVerified")]
-        for group in (private, public, verified, domains):
-            if group:
-                domain = str(group[0].get("domain") or "").strip()
-                if domain:
-                    return domain
-        raise MailboxError("YYDS 无已验证域名可用")
+
+        def _names(group: List[Dict[str, Any]]) -> List[str]:
+            out: List[str] = []
+            seen = set()
+            for item in group:
+                domain = str(item.get("domain") or "").strip()
+                if not domain:
+                    continue
+                key = domain.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(domain)
+            return out
+
+        private = [d for d in rows if d.get("isVerified") and not d.get("isPublic")]
+        public = [d for d in rows if d.get("isVerified") and d.get("isPublic")]
+        verified = [d for d in rows if d.get("isVerified")]
+        pool: List[str] = []
+        for group in (private, public, verified, rows):
+            names = _names(group)
+            if names:
+                pool = names
+                break
+        if not pool:
+            raise MailboxError("YYDS 无已验证域名可用")
+
+        preferred = _yyds_normalize_domain_list(
+            self.config.get("yyds_domains")
+            if self.config.get("yyds_domains") is not None
+            else self.config.get("yyds_domain_whitelist")
+        )
+        if preferred:
+            allow = set(preferred)
+            filtered = [d for d in pool if d.lower() in allow]
+            # Keep whitelist order if API order is sparse.
+            if filtered:
+                # re-order by whitelist order for stable RR
+                rank = {name: i for i, name in enumerate(preferred)}
+                filtered.sort(key=lambda d: rank.get(d.lower(), 10**9))
+                return filtered
+            # Whitelist provided but no overlap: fail loudly instead of silently
+            # falling back to a single unintended domain.
+            raise MailboxError(
+                "YYDS 配置的 yyds_domains 与接口返回域名无交集: "
+                + ",".join(preferred[:8])
+            )
+        return pool
+
+    def _pick_domain(self, *, exclude: Optional[set] = None) -> str:
+        pool = self._domain_candidates()
+        blocked = {str(x or "").strip().lower() for x in (exclude or set()) if str(x or "").strip()}
+        if blocked:
+            filtered = [d for d in pool if d.lower() not in blocked]
+            if filtered:
+                pool = filtered
+        return _yyds_next_round_robin_domain(pool)
 
     def create(self) -> Tuple[str, str]:
-        domain = self._pick_domain()
         last_error: Optional[Exception] = None
+        used_domains: set = set()
         # YYDS rate-limits account creation aggressively under multi-worker bursts.
         for attempt in range(1, 6):
+            domain = self._pick_domain(exclude=used_domains)
+            used_domains.add(domain.lower())
             username = "xai" + "".join(
                 secrets.choice(string.ascii_lowercase + string.digits) for _ in range(10)
             )
