@@ -12,5 +12,22 @@
   "local_proxy_port": 0,
   "user_agent": "",
   "enable_metrics": true,
-  "notes": "Phase 1 uses DrissionPage + optional local_proxy_forwarder for auth proxies."
+  "browser_max_tasks": 25,
+  "browser_max_age_sec": 1800,
+  "browser_idle_ttl_sec": 600,
+  "browser_maintenance_interval_sec": 5.0,
+  "browser_max_rss_mb": 2048,
+  "browser_max_consecutive_failures": 2,
+  "lease_ttl_sec": 240,
+  "queue_timeout_sec": 180,
+  "strict_fingerprint": true,
+  "locale": "",
+  "accept_language": "",
+  "external_provider_workers": 20,
+  "external_queue_limit": 64,
+  "submit_workers": 5,
+  "submit_permit_lease_sec": 120,
+  "browser_path": "/usr/bin/google-chrome",
+  "no_sandbox": false,
+  "notes": "Persistent DrissionPage slots use immutable proxy/UA affinity and a fresh browser context per task."
 }
