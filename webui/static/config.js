@@ -59,6 +59,18 @@ function fill(data) {
   set("proxy_mode", f.proxy_mode || "auto");
   set("proxy", f.proxy || "");
   set("proxy_file", f.proxy_file || "proxies.txt");
+  set("proxy_subscription_url", f.proxy_subscription_url || "");
+  set("proxy_subscription_local_http", f.proxy_subscription_local_http || "");
+  set("embedded_proxy_enabled", !!f.embedded_proxy_enabled, true);
+  set("embedded_proxy_binary", f.embedded_proxy_binary || "");
+  set("embedded_proxy_base_port", f.embedded_proxy_base_port == null ? 28000 : f.embedded_proxy_base_port);
+  set("embedded_proxy_max_nodes", f.embedded_proxy_max_nodes == null ? 50 : f.embedded_proxy_max_nodes);
+  set("embedded_proxy_probe_host", f.embedded_proxy_probe_host || "accounts.x.ai");
+  set("embedded_proxy_probe_port", f.embedded_proxy_probe_port == null ? 443 : f.embedded_proxy_probe_port);
+  set(
+    "embedded_proxy_probe_timeout_sec",
+    f.embedded_proxy_probe_timeout_sec == null ? 5 : f.embedded_proxy_probe_timeout_sec
+  );
   set("proxy_parent", f.proxy_parent || "");
   set("local_proxy_port", f.local_proxy_port || 17890);
   set("proxy_random", !!f.proxy_random, true);
@@ -101,6 +113,15 @@ function collectFields() {
     proxy_mode: g("proxy_mode"),
     proxy: g("proxy"),
     proxy_file: g("proxy_file"),
+    proxy_subscription_url: g("proxy_subscription_url"),
+    proxy_subscription_local_http: g("proxy_subscription_local_http"),
+    embedded_proxy_enabled: g("embedded_proxy_enabled", true),
+    embedded_proxy_binary: g("embedded_proxy_binary"),
+    embedded_proxy_base_port: Number(g("embedded_proxy_base_port") || 28000),
+    embedded_proxy_max_nodes: Number(g("embedded_proxy_max_nodes") || 50),
+    embedded_proxy_probe_host: g("embedded_proxy_probe_host"),
+    embedded_proxy_probe_port: Number(g("embedded_proxy_probe_port") || 443),
+    embedded_proxy_probe_timeout_sec: Number(g("embedded_proxy_probe_timeout_sec") || 5),
     proxy_parent: g("proxy_parent"),
     local_proxy_port: Number(g("local_proxy_port") || 17890),
     proxy_random: g("proxy_random", true),
@@ -148,6 +169,94 @@ $("btnSavePool").onclick = async () => {
   } catch (e) { setMsg(String(e.message || e), true); }
 };
 
+
+function renderSubImport(data) {
+  const lines = [];
+  const schemes = data.scheme_counts || {};
+  const schemeText = Object.keys(schemes)
+    .map((k) => `${k}:${schemes[k]}`)
+    .join(", ") || "-";
+  lines.push(`订阅: ${data.url || "-"}`);
+  lines.push(`格式: ${data.body_kind || "-"} | 节点: ${data.node_count || 0} | 可用HTTP: ${data.usable_http_count || 0} | 跳过: ${data.skipped_count || 0}`);
+  lines.push(`协议统计: ${schemeText}`);
+  lines.push(`代理模式: ${data.proxy_mode || "-"} | 直连代理: ${data.proxy || "-"} | 本地回退: ${data.applied_local_http ? "是" : "否"}`);
+  if ((data.warnings || []).length) {
+    lines.push("");
+    lines.push("警告:");
+    data.warnings.forEach((w) => lines.push(`- ${w}`));
+  }
+  if ((data.sample_nodes || []).length) {
+    lines.push("");
+    lines.push("样例节点:");
+    data.sample_nodes.slice(0, 8).forEach((n, idx) => {
+      const flag = n.usable_http ? "http" : "need-client";
+      lines.push(
+        `#${idx + 1} [${flag}] ${n.scheme || "-"} ${n.name || ""} ${n.host || ""}:${n.port || 0}`.trim()
+      );
+    });
+  }
+  $("proxyTestResult").textContent = lines.join("\n");
+}
+
+$("btnImportSub").onclick = async () => {
+  try {
+    setMsg("正在拉取订阅…");
+    $("proxyTestResult").textContent = "拉取订阅中…";
+    $("btnImportSub").disabled = true;
+
+    // 先把当前表单字段落盘，保证订阅 URL / 本地 HTTP 入口被记住。
+    const saved = await api("/api/config-center", {
+      method: "PUT",
+      body: JSON.stringify({
+        fields: collectFields(),
+        proxy_pool_text: $("proxyPoolText").value,
+      }),
+    });
+    fill(saved);
+
+    const subUrl = (form.elements.namedItem("proxy_subscription_url") || {}).value || "";
+    const localHttp = (form.elements.namedItem("proxy_subscription_local_http") || {}).value || "";
+    const data = await api("/api/proxy-pool/import-subscription", {
+      method: "POST",
+      body: JSON.stringify({
+        url: subUrl,
+        proxy_subscription_url: subUrl,
+        proxy_subscription_local_http: localHttp,
+        write_pool: true,
+        use_local_http_if_empty: true,
+        timeout: 20,
+      }),
+    });
+
+    if (data.text != null) {
+      $("proxyPoolText").value = data.text || "";
+    }
+    const pool = data.proxy_pool || {};
+    if (pool.path || pool.line_count != null) {
+      $("poolMeta").textContent = `代理池文件: ${pool.path || "-"} | 有效行: ${pool.line_count || 0} | 存在: ${pool.exists ? "是" : "否"}`;
+    }
+    // 刷新配置中心字段（代理模式 / 直连代理可能被回退改写）
+    await loadAll();
+    renderSubImport(data);
+
+    const usable = data.usable_http_count || 0;
+    const total = data.node_count || 0;
+    if (usable > 0) {
+      setMsg(`订阅导入完成：可用 HTTP ${usable}/${total}`);
+    } else if (data.applied_local_http) {
+      setMsg(`订阅无 HTTP 节点，已回退本地入口（节点 ${total}）`, true);
+    } else {
+      setMsg(`订阅已拉取，但无可用 HTTP 节点（节点 ${total}）`, true);
+    }
+  } catch (e) {
+    setMsg(String(e.message || e), true);
+    $("proxyTestResult").textContent = "订阅导入失败: " + String(e.message || e);
+  } finally {
+    $("btnImportSub").disabled = false;
+  }
+};
+
+
 loadAll().catch(e => setMsg(String(e.message || e), true));
 
 
@@ -192,6 +301,113 @@ $("btnTestPool").onclick = async () => {
     $("btnTestPool").disabled = false;
   }
 };
+
+
+
+
+function renderEmbeddedStatus(data) {
+  const box = $("embeddedProxyStatus");
+  const summary = $("embeddedProxySummary");
+  if (!box) return;
+  const enabled = !!data.enabled;
+  const running = !!data.running;
+  const healthy = data.healthy == null ? "-" : data.healthy;
+  const total = data.total == null ? "-" : data.total;
+  const leases = data.leases == null ? "-" : data.leases;
+  const lastError = data.last_error || "";
+  if (summary) {
+    summary.textContent =
+      `状态: ${enabled ? "已启用" : "未启用"} | ${running ? "运行中" : "未运行"} | 健康 ${healthy}/${total} | 租约 ${leases}` +
+      (lastError ? ` | 错误: ${lastError}` : "");
+  }
+  try {
+    box.textContent = JSON.stringify(data, null, 2);
+  } catch {
+    box.textContent = String(data);
+  }
+}
+
+async function refreshEmbeddedStatus() {
+  const data = await api("/api/embedded-proxy/status");
+  renderEmbeddedStatus(data || {});
+  return data;
+}
+
+const btnEmbeddedStart = $("btnEmbeddedStart");
+if (btnEmbeddedStart) {
+  btnEmbeddedStart.onclick = async () => {
+    try {
+      setMsg("正在启动/重载内嵌代理…");
+      btnEmbeddedStart.disabled = true;
+      // 先保存当前表单，避免用旧配置启动
+      const saved = await api("/api/config-center", {
+        method: "PUT",
+        body: JSON.stringify({
+          fields: collectFields(),
+          proxy_pool_text: $("proxyPoolText").value,
+        }),
+      });
+      fill(saved);
+      const data = await api("/api/embedded-proxy/reload", { method: "POST", body: "{}" });
+      renderEmbeddedStatus(data || {});
+      setMsg(`内嵌代理已启动/重载：健康 ${(data && data.healthy) || 0}/${(data && data.total) || 0}`);
+    } catch (e) {
+      setMsg(String(e.message || e), true);
+    } finally {
+      btnEmbeddedStart.disabled = false;
+    }
+  };
+}
+
+const btnEmbeddedProbe = $("btnEmbeddedProbe");
+if (btnEmbeddedProbe) {
+  btnEmbeddedProbe.onclick = async () => {
+    try {
+      setMsg("正在预检内嵌节点…");
+      btnEmbeddedProbe.disabled = true;
+      const data = await api("/api/embedded-proxy/probe", { method: "POST", body: "{}" });
+      renderEmbeddedStatus(data || {});
+      setMsg(`预检完成：健康 ${(data && data.healthy) || 0}/${(data && data.total) || 0}`);
+    } catch (e) {
+      setMsg(String(e.message || e), true);
+    } finally {
+      btnEmbeddedProbe.disabled = false;
+    }
+  };
+}
+
+const btnEmbeddedStatus = $("btnEmbeddedStatus");
+if (btnEmbeddedStatus) {
+  btnEmbeddedStatus.onclick = async () => {
+    try {
+      setMsg("正在刷新内嵌代理状态…");
+      btnEmbeddedStatus.disabled = true;
+      await refreshEmbeddedStatus();
+      setMsg("状态已刷新");
+    } catch (e) {
+      setMsg(String(e.message || e), true);
+    } finally {
+      btnEmbeddedStatus.disabled = false;
+    }
+  };
+}
+
+const btnEmbeddedStop = $("btnEmbeddedStop");
+if (btnEmbeddedStop) {
+  btnEmbeddedStop.onclick = async () => {
+    try {
+      setMsg("正在停止内嵌代理…");
+      btnEmbeddedStop.disabled = true;
+      const data = await api("/api/embedded-proxy/stop", { method: "POST", body: "{}" });
+      renderEmbeddedStatus(data || {});
+      setMsg("内嵌代理已停止");
+    } catch (e) {
+      setMsg(String(e.message || e), true);
+    } finally {
+      btnEmbeddedStop.disabled = false;
+    }
+  };
+}
 
 
 function setupHelpTips() {

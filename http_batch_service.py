@@ -2576,10 +2576,15 @@ class BatchService:
             last.setdefault("running", False)
             last.setdefault("total", 0)
             last.setdefault("healthy", 0)
+            last.setdefault("leases", 0)
+            last.setdefault("last_error", "")
             return last
         status = dict(manager.status() or {})
         status["enabled"] = True
         status["node_count"] = int(status.get("total") or 0)
+        status.setdefault("leases", int(status.get("leases") or 0))
+        last = dict(self._embedded_proxy_last or {})
+        status.setdefault("last_error", last.get("last_error") or "")
         return status
 
     def probe_embedded_proxy(self) -> dict:
@@ -2595,6 +2600,49 @@ class BatchService:
         return probe_info
 
 
+
+
+    def stop_embedded_proxy(self) -> dict:
+        """Stop embedded mihomo; reject when a batch is running."""
+        if self.is_busy():
+            raise BatchBusyError("批次运行中，禁止停止内嵌代理")
+        raw = dict(self.settings.config or {})
+        enabled = _as_bool(raw.get("embedded_proxy_enabled"))
+        manager = self._embedded_proxy_manager
+        if manager is not None:
+            try:
+                manager.stop()
+            except Exception as exc:
+                raise TuiConfigError(f"停止内嵌 mihomo 失败: {exc}") from exc
+        out = {
+            "enabled": enabled,
+            "running": False,
+            "total": 0,
+            "healthy": 0,
+            "leases": 0,
+            "node_count": 0,
+            "last_error": "",
+        }
+        # Keep last known totals if manager still holds node table after stop.
+        if manager is not None:
+            try:
+                status = dict(manager.status() or {})
+                out["total"] = int(status.get("total") or 0)
+                out["healthy"] = int(status.get("healthy") or 0)
+                out["leases"] = int(status.get("leases") or 0)
+                out["node_count"] = int(status.get("total") or 0)
+                out["nodes"] = status.get("nodes") or []
+            except Exception:
+                pass
+        self._embedded_proxy_last = out
+        return out
+
+    def reload_embedded_proxy(self) -> dict:
+        """Stop then ensure/start embedded mihomo; reject when a batch is running."""
+        if self.is_busy():
+            raise BatchBusyError("批次运行中，禁止重载内嵌代理")
+        # Force rebuild even if currently running.
+        return self.ensure_embedded_proxy(force_reload=True)
 
     def test_proxy_pool(self, *, count: int = 5, text_value: Optional[str] = None, timeout: float = 12.0) -> Dict[str, object]:
         return test_proxy_pool_sample(

@@ -146,6 +146,73 @@ class WebUIAppTests(unittest.TestCase):
             page = client.get("/config")
             self.assertIn("随机测试5条", page.text)
 
+    def test_embedded_proxy_status_and_reload_guard(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            service = self._service(root)
+            service.settings.config["embedded_proxy_enabled"] = True
+            service.settings.config["embedded_proxy_binary"] = "/usr/bin/verge-mihomo"
+            service.settings.config["embedded_proxy_base_port"] = 28000
+            service.settings.config["embedded_proxy_max_nodes"] = 10
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+
+            status_payload = {
+                "enabled": True,
+                "running": True,
+                "healthy": 2,
+                "total": 3,
+                "leases": 1,
+                "last_error": "",
+            }
+            with mock.patch.object(service, "get_embedded_proxy_status", return_value=status_payload):
+                r = client.get("/api/embedded-proxy/status")
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            self.assertTrue(body["enabled"])
+            self.assertTrue(body["running"])
+            self.assertEqual(body["healthy"], 2)
+            self.assertEqual(body["total"], 3)
+
+            start_payload = dict(status_payload)
+            start_payload["healthy"] = 3
+            with mock.patch.object(service, "ensure_embedded_proxy", return_value=start_payload) as ensure:
+                with mock.patch.object(service, "probe_embedded_proxy", return_value={"enabled": True, "healthy": 3, "total": 3}):
+                    r = client.post("/api/embedded-proxy/start", json={})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["healthy"], 3)
+            ensure.assert_called()
+
+            with mock.patch.object(service, "probe_embedded_proxy", return_value={"enabled": True, "healthy": 2, "total": 3}):
+                r = client.post("/api/embedded-proxy/probe", json={})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["healthy"], 2)
+
+            with mock.patch.object(service, "is_busy", return_value=True):
+                r = client.post("/api/embedded-proxy/reload", json={})
+            self.assertIn(r.status_code, {400, 409})
+            detail = r.json().get("detail") or ""
+            self.assertTrue(any("一" <= ch <= "鿿" for ch in str(detail)), detail)
+
+            with mock.patch.object(service, "is_busy", return_value=True):
+                r = client.post("/api/embedded-proxy/stop", json={})
+            self.assertIn(r.status_code, {400, 409})
+
+    def test_config_page_has_embedded_proxy_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            service = self._service(root)
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+            page = client.get("/config")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("embedded_proxy_enabled", page.text)
+            self.assertIn("btnEmbeddedProbe", page.text)
+            self.assertIn("内嵌代理内核", page.text)
+            self.assertIn("embedded_proxy_base_port", page.text)
+            self.assertIn("btnEmbeddedStart", page.text)
+            self.assertIn("btnEmbeddedStatus", page.text)
+
 
 if __name__ == "__main__":
     unittest.main()

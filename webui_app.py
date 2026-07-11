@@ -159,6 +159,31 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
 
+    @app.post("/api/proxy-pool/import-subscription")
+    def proxy_pool_import_subscription(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        data = dict(payload or {})
+        url = str(data.get("url") or data.get("proxy_subscription_url") or "").strip()
+        write_pool = True if data.get("write_pool") is None else bool(data.get("write_pool"))
+        timeout = float(data.get("timeout") or 20)
+        use_local = True if data.get("use_local_http_if_empty") is None else bool(data.get("use_local_http_if_empty"))
+        local_http = str(
+            data.get("local_http")
+            or data.get("proxy_subscription_local_http")
+            or ""
+        ).strip()
+        try:
+            return get_service().import_proxy_subscription(
+                url=url,
+                write_pool=write_pool,
+                timeout=timeout,
+                use_local_http_if_empty=use_local,
+                local_http=local_http,
+            )
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+
     @app.post("/api/proxy-pool/test")
     def proxy_pool_test(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         data = dict(payload or {})
@@ -174,6 +199,65 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
                 text_value=None if text_value is None else str(text_value),
                 timeout=timeout,
             )
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+
+
+    @app.get("/api/embedded-proxy/status")
+    def embedded_proxy_status() -> Dict[str, Any]:
+        try:
+            return get_service().get_embedded_proxy_status()
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+
+    @app.post("/api/embedded-proxy/start")
+    def embedded_proxy_start(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        data = dict(payload or {})
+        force = bool(data.get("force") or data.get("force_reload") or False)
+        try:
+            # ensure already probes nodes; keep an explicit probe when already running.
+            out = get_service().ensure_embedded_proxy(force_reload=force)
+            if out.get("enabled") and out.get("running"):
+                try:
+                    probe = get_service().probe_embedded_proxy()
+                    if isinstance(probe, dict):
+                        out = dict(out)
+                        out["probe"] = probe
+                        if probe.get("healthy") is not None:
+                            out["healthy"] = probe.get("healthy")
+                        if probe.get("total") is not None:
+                            out["total"] = probe.get("total")
+                except TuiConfigError:
+                    # ensure may have already probed; status still useful
+                    pass
+            return out
+        except BatchBusyError as exc:
+            raise _err(exc, 409) from exc
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+
+    @app.post("/api/embedded-proxy/probe")
+    def embedded_proxy_probe(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        try:
+            return get_service().probe_embedded_proxy()
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+
+    @app.post("/api/embedded-proxy/stop")
+    def embedded_proxy_stop(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        try:
+            return get_service().stop_embedded_proxy()
+        except BatchBusyError as exc:
+            raise _err(exc, 409) from exc
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+
+    @app.post("/api/embedded-proxy/reload")
+    def embedded_proxy_reload(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        try:
+            return get_service().reload_embedded_proxy()
+        except BatchBusyError as exc:
+            raise _err(exc, 409) from exc
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
 
