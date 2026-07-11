@@ -566,7 +566,7 @@ class SnapshotMetricsTests(unittest.TestCase):
         runner.plan.workers = 2
         # no prealloc
         self.assertEqual(len(runner.workers), 0)
-        with mock.patch.object(runner, "_spawn_one", side_effect=lambda w, acquire_proxy=True: setattr(w, "status", "running")):
+        with mock.patch.object(runner, "_spawn_one", side_effect=lambda w, acquire_proxy=True: (setattr(w, "status", "running") or True)):
             runner.started = True
             runner.phase = "running"
             runner._spawn_available()
@@ -581,6 +581,68 @@ class SnapshotMetricsTests(unittest.TestCase):
             runner.workers[1].status = "running"
             runner._spawn_available()
             self.assertEqual(runner.started_tasks, 3)
+
+
+    def test_continuous_proxy_shortage_does_not_storm_failures(self):
+        """Proxy lease misses must pause refill, not inflate failed into thousands."""
+        runner = self._make_runner(count=1)
+        runner.plan.target_mode = svc.TARGET_MODE_CONTINUOUS
+        runner.plan.target_success = 0
+        runner.plan.count = 0
+        runner.plan.workers = 8
+        runner.plan.embedded_proxy_enabled = True
+        runner.started = True
+        runner.phase = "running"
+        runner.started_at_monotonic = 1000.0
+
+        class FakeManager:
+            def acquire(self, exclude_ids=None):
+                return None
+
+            def release(self, *args, **kwargs):
+                return None
+
+        runner.embedded_proxy_manager = FakeManager()
+
+        # Many ticks should still keep counters near zero.
+        for _ in range(50):
+            runner._spawn_available()
+
+        self.assertEqual(runner.started_tasks, 0)
+        self.assertEqual(runner.failed_count, 0)
+        self.assertEqual(runner.completed, 0)
+        self.assertTrue(runner.refill_paused)
+        self.assertLessEqual(len(runner.workers), 1)
+        # next tick while paused still no storm
+        before_idx = runner.next_index
+        runner._spawn_available()
+        self.assertEqual(runner.next_index, before_idx)
+        self.assertEqual(runner.failed_count, 0)
+
+    def test_started_tasks_only_after_process_launch(self):
+        runner = self._make_runner(count=5)
+        runner.plan.workers = 3
+        runner.started = True
+        runner.phase = "running"
+
+        def fake_spawn(worker, acquire_proxy=True):
+            # first call fails resource, later succeed
+            if runner.started_tasks == 0 and worker.index == 1:
+                worker.last_log = "没有可用的内嵌代理节点"
+                return False
+            worker.status = "running"
+            return True
+
+        with mock.patch.object(runner, "_spawn_one", side_effect=fake_spawn):
+            runner._spawn_available()
+            # first attempt pauses; no started_tasks
+            self.assertEqual(runner.started_tasks, 0)
+            self.assertTrue(runner.refill_paused)
+            # force unpause and continue
+            runner._clear_refill_pause()
+            runner._spawn_available()
+            self.assertEqual(runner.started_tasks, 3)
+            self.assertEqual(len(runner.active), 3)
 
     def test_snapshot_metrics_running(self):
         runner = self._make_runner(count=3)
@@ -850,7 +912,9 @@ class EmbeddedProxyAssignmentTests(unittest.TestCase):
         manager.acquire.return_value = self._node("12", "jp", 28005)
         runner.embedded_proxy_manager = manager
 
-        worker = runner.workers[0]
+        worker = svc.WorkerState(index=1)
+        runner.workers = [worker]
+        runner.worker_by_index = {1: worker}
         worker.accounts_path = Path("accounts_001.txt")
         assigned = runner._acquire_embedded_proxy(worker)
         self.assertTrue(assigned)
@@ -868,7 +932,9 @@ class EmbeddedProxyAssignmentTests(unittest.TestCase):
     def test_command_for_keeps_proxy_args_when_embedded_disabled(self):
         plan = self._make_plan(embedded=False, proxy_args=["--proxy-file", "proxies.txt"])
         runner = svc.BatchRunner(plan)
-        worker = runner.workers[0]
+        worker = svc.WorkerState(index=1)
+        runner.workers = [worker]
+        runner.worker_by_index = {1: worker}
         worker.accounts_path = Path("accounts_001.txt")
         command = runner._command_for(worker)
         self.assertIn("--proxy-file", command)
@@ -897,7 +963,9 @@ class EmbeddedProxyAssignmentTests(unittest.TestCase):
         manager.acquire.side_effect = list(nodes)
         runner.embedded_proxy_manager = manager
 
-        worker = runner.workers[0]
+        worker = svc.WorkerState(index=1)
+        runner.workers = [worker]
+        runner.worker_by_index = {1: worker}
         worker.accounts_path = Path("accounts_001.txt")
         worker.log_path = Path("worker_001.log")
 
@@ -908,6 +976,7 @@ class EmbeddedProxyAssignmentTests(unittest.TestCase):
             w.status = "running"
             w.process = mock.Mock()
             w.process.poll.return_value = None
+            return True
 
         # Attempt 1
         self.assertTrue(runner._acquire_embedded_proxy(worker))
@@ -961,7 +1030,9 @@ class EmbeddedProxyAssignmentTests(unittest.TestCase):
         manager = mock.Mock()
         manager.acquire.return_value = self._node("n1", "jp", 28001)
         runner.embedded_proxy_manager = manager
-        worker = runner.workers[0]
+        worker = svc.WorkerState(index=1)
+        runner.workers = [worker]
+        runner.worker_by_index = {1: worker}
         worker.accounts_path = Path("a.txt")
         self.assertTrue(runner._acquire_embedded_proxy(worker))
         worker.status = "running"

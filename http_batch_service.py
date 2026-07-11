@@ -36,6 +36,8 @@ RUNS_DIR = ROOT_DIR / "http_runs"
 MAX_COUNT = 99999999
 TARGET_MODE_COUNT = "count"
 TARGET_MODE_CONTINUOUS = "continuous"
+DEFAULT_REFILL_PAUSE_SEC = 2.0
+REFILL_PAUSE_LOG_INTERVAL_SEC = 5.0
 RECENT_WORKER_WINDOW = 200
 MAX_WORKERS = 32
 MAX_LOCAL_TURNSTILE_WORKERS = 3  # default local Turnstile concurrency cap
@@ -357,6 +359,8 @@ def _looks_like_proxy_failure(text: str) -> bool:
     if not blob:
         return False
     lower = blob.lower()
+    if "没有可用的内嵌代理节点" in blob or "内嵌代理已启用但管理器未就绪" in blob:
+        return True
     for marker in PROXY_FAILURE_MARKERS:
         if marker.lower() in lower:
             return True
@@ -1020,6 +1024,8 @@ def classify_failure_text(text: str) -> str:
         or "proxyerror" in t
         or "407" in t
         or "connect tunnel failed" in t
+        or "没有可用的内嵌代理节点" in raw
+        or "内嵌代理" in raw and "未就绪" in raw
     ):
         return "proxy_error"
     if "turnstile" in t and ("timeout" in t or "超时" in raw or "未捕获到可用" in raw):
@@ -1070,6 +1076,10 @@ class BatchRunner:
         self.owns_broker = False
         self.embedded_proxy_manager = None
         self.recent_workers: Deque[WorkerState] = deque(maxlen=RECENT_WORKER_WINDOW)
+        self.refill_paused = False
+        self.refill_pause_until: float = 0.0
+        self.refill_pause_reason: str = ""
+        self._last_refill_pause_log_at: float = 0.0
 
     @staticmethod
     def _free_loopback_port() -> int:
@@ -1506,6 +1516,50 @@ class BatchRunner:
         )
         worker.convert_thread.start()
 
+    def _pause_refill(self, reason: str, *, seconds: float | None = None) -> None:
+        """Temporarily stop creating new tasks (resource shortage, not business failure)."""
+        wait = DEFAULT_REFILL_PAUSE_SEC if seconds is None else max(0.2, float(seconds))
+        now = time.monotonic()
+        until = now + wait
+        # Keep the longer pause if already paused.
+        if self.refill_paused and self.refill_pause_until > until:
+            until = self.refill_pause_until
+        self.refill_paused = True
+        self.refill_pause_until = until
+        self.refill_pause_reason = str(reason or "补货暂停")
+        if (now - float(self._last_refill_pause_log_at or 0.0)) >= REFILL_PAUSE_LOG_INTERVAL_SEC:
+            self._last_refill_pause_log_at = now
+            self._log(
+                "SYSTEM",
+                f"补货暂停 {wait:.1f}s：{self.refill_pause_reason}（不计入失败）",
+            )
+
+    def _clear_refill_pause(self, *, resume_log: bool = False) -> None:
+        was_paused = bool(self.refill_paused)
+        self.refill_paused = False
+        self.refill_pause_until = 0.0
+        reason = self.refill_pause_reason
+        self.refill_pause_reason = ""
+        if was_paused and resume_log:
+            self._log("SYSTEM", f"补货恢复：{reason or '资源已恢复'}")
+
+    def _refill_pause_active(self) -> bool:
+        if not self.refill_paused:
+            return False
+        now = time.monotonic()
+        if now >= float(self.refill_pause_until or 0.0):
+            self._clear_refill_pause(resume_log=True)
+            return False
+        # Throttled reminder while still paused.
+        if (now - float(self._last_refill_pause_log_at or 0.0)) >= REFILL_PAUSE_LOG_INTERVAL_SEC:
+            remain = max(0.0, float(self.refill_pause_until) - now)
+            self._last_refill_pause_log_at = now
+            self._log(
+                "SYSTEM",
+                f"补货仍暂停，剩余 {remain:.1f}s：{self.refill_pause_reason or '等待资源'}",
+            )
+        return True
+
     def _acquire_embedded_proxy(self, worker: WorkerState) -> bool:
         """Lease a node for this worker. Returns False if none available."""
         if not self.plan.embedded_proxy_enabled:
@@ -1585,11 +1639,23 @@ class BatchRunner:
         worker.process = None
         worker.return_code = None
         if not self._acquire_embedded_proxy(worker):
-            self._mark_terminal(worker, "failed")
+            # Already-started task cannot recover: count one failure, then pause refill.
             worker.last_log = worker.last_log or "没有可用的内嵌代理节点"
+            self._mark_terminal(worker, "failed")
             self._record_failure(worker, worker.last_log)
+            self._log(
+                f"W{worker.index:02d}",
+                f"[Proxy] 无可用节点，停止本任务重试并暂停补货 | {worker.last_log}",
+            )
+            self._pause_refill(worker.last_log)
             return True  # handled (terminal)
-        self._spawn_one(worker, acquire_proxy=False)
+        launched = self._spawn_one(worker, acquire_proxy=False)
+        if not launched:
+            if worker.status not in {"failed", "succeeded", "stopped"}:
+                self._mark_terminal(worker, "failed")
+                self._record_failure(worker, worker.last_log or "启动失败")
+            self._pause_refill(worker.last_log or "启动失败")
+            return True
         return True
 
     def _release_all_embedded_proxies(self) -> None:
@@ -1599,18 +1665,22 @@ class BatchRunner:
             if worker.proxy_node_id:
                 self._release_embedded_proxy(worker, failed=False)
 
-    def _spawn_one(self, worker: WorkerState, *, acquire_proxy: bool = True) -> None:
+    def _spawn_one(self, worker: WorkerState, *, acquire_proxy: bool = True) -> bool:
+        """Try to launch one worker process.
+
+        Returns True only when the subprocess is actually running.
+        Resource shortages (no proxy node) return False without counting failure.
+        """
         worker.accounts_path = self.run_dir / f"accounts_{worker.index:03d}.txt"
         worker.log_path = self.run_dir / f"worker_{worker.index:03d}.log"
         if acquire_proxy and self.plan.embedded_proxy_enabled:
             if not self._acquire_embedded_proxy(worker):
-                self._mark_terminal(worker, "failed")
                 if not worker.last_log:
                     worker.last_log = "没有可用的内嵌代理节点"
-                self._record_failure(worker, worker.last_log)
-                self._log(f"W{worker.index:02d}", worker.last_log)
-                return
+                # Do not mark failed / do not write failure counters.
+                return False
         command = self._command_for(worker)
+        log_handle = None
         try:
             log_handle = worker.log_path.open("w", encoding="utf-8", buffering=1)
             process = subprocess.Popen(
@@ -1629,11 +1699,12 @@ class BatchRunner:
             self._release_embedded_proxy(worker, failed=True)
             self._record_failure(worker, worker.last_log)
             self._log(f"W{worker.index:02d}", worker.last_log)
-            try:
-                log_handle.close()
-            except UnboundLocalError:
-                pass
-            return
+            if log_handle is not None:
+                try:
+                    log_handle.close()
+                except OSError:
+                    pass
+            return False
 
         worker.process = process
         worker.status = "running"
@@ -1654,9 +1725,13 @@ class BatchRunner:
                     process.stdout.close()
                 except OSError:
                     pass
-                log_handle.close()
+                try:
+                    log_handle.close()
+                except OSError:
+                    pass
 
         threading.Thread(target=copy_and_queue, daemon=True).start()
+        return True
 
     def _spawn_available(self) -> None:
         if self.done:
@@ -1673,13 +1748,53 @@ class BatchRunner:
                             elif int(getattr(self.plan, "continuous_max_runtime_min", 0) or 0) > 0:
                                 self._log("SYSTEM", "已达最长运行时间，停止补货并收尾")
             return
-        while len(self.active) < self.plan.workers and self._should_refill():
+        if self._refill_pause_active():
+            return
+
+        # Hard cap attempts in one tick: never create more than worker slots.
+        slots = max(0, int(self.plan.workers) - len(self.active))
+        attempts = 0
+        while slots > 0 and attempts < int(self.plan.workers) and self._should_refill():
+            if self._refill_pause_active():
+                break
             worker = WorkerState(index=self.next_index)
             self.next_index += 1
-            self.started_tasks += 1
+            attempts += 1
+            # staged until process actually starts
+            worker.status = "queued"
             self.workers.append(worker)
             self.worker_by_index[worker.index] = worker
-            self._spawn_one(worker)
+            launched = self._spawn_one(worker)
+            if launched:
+                self.started_tasks += 1
+                slots = max(0, int(self.plan.workers) - len(self.active))
+                continue
+            # Launch failed without becoming active.
+            reason = worker.last_log or "启动失败"
+            # Drop this logical slot from hot lists; do not count as business failure
+            # when it is a resource shortage (proxy unavailable).
+            resource_shortage = (
+                "没有可用的内嵌代理节点" in reason
+                or "内嵌代理已启用但管理器未就绪" in reason
+            )
+            if resource_shortage:
+                # Remove non-started worker so it does not pollute active/queues.
+                try:
+                    self.workers.remove(worker)
+                except ValueError:
+                    pass
+                self.worker_by_index.pop(worker.index, None)
+                self._pause_refill(reason)
+                break
+            # Real launch error already marked failed inside _spawn_one.
+            if worker.status not in {"failed", "stopped", "succeeded"}:
+                self._mark_terminal(worker, "failed")
+                self._record_failure(worker, reason)
+            # Still respect one-tick budget; avoid tight-loop storm.
+            slots = max(0, int(self.plan.workers) - len(self.active))
+            # brief pause after hard spawn errors too
+            self._pause_refill(reason, seconds=min(DEFAULT_REFILL_PAUSE_SEC, 1.0))
+            break
 
     def _drain_events(self) -> None:
         while True:
@@ -1732,13 +1847,9 @@ class BatchRunner:
                 reason = f"协议任务退出，退出码 {return_code}"
                 worker.last_log = reason
                 if self._maybe_retry_proxy_node(worker, reason):
-                    # either respawned (running) or terminal without node
+                    # either respawned (running) or already marked terminal inside helper
                     if worker.status == "running":
                         continue
-                    # retry helper may set failed without counters
-                    if worker.status == "failed" and worker.index not in self._failure_recorded:
-                        self.failed_count += 1
-                        self.recent_workers.append(worker)
                     self._log(f"W{worker.index:02d}", worker.last_log)
                     continue
                 self._mark_terminal(worker, "failed")
@@ -1864,6 +1975,8 @@ class BatchRunner:
             "done": self.done,
             "stopping": self.stopping,
             "phase": self.phase,
+            "refill_paused": bool(self.refill_paused),
+            "refill_pause_reason": self.refill_pause_reason or "",
             "target_mode": getattr(self.plan, "target_mode", TARGET_MODE_COUNT),
             "target_success": int(getattr(self.plan, "target_success", 0) or 0),
             "count": planned_count,
