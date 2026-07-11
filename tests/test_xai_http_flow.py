@@ -721,5 +721,167 @@ class XAIHttpFlowTests(unittest.TestCase):
             self.assertGreater(float(json.loads(state_path.read_text(encoding="utf-8"))["last_create_at"]), 0)
 
 
+
+    def test_proxy_has_embedded_auth(self):
+        self.assertTrue(flow._proxy_has_embedded_auth("http://user:pass@host:1000"))
+        self.assertFalse(flow._proxy_has_embedded_auth("http://127.0.0.1:17890"))
+        self.assertFalse(flow._proxy_has_embedded_auth("http://host:1000"))
+
+    def test_prepare_browser_proxy_auth_uses_forwarder(self):
+        logs = []
+        with mock.patch(
+            "local_proxy_forwarder.ensure_local_forwarder",
+            return_value=("http://127.0.0.1:17999", True),
+        ) as mocked:
+            browser_proxy, key = flow._prepare_browser_proxy(
+                "http://user:pass@gate.example:1000",
+                log_callback=logs.append,
+            )
+        self.assertEqual(browser_proxy, "http://127.0.0.1:17999")
+        self.assertTrue(key)
+        mocked.assert_called_once()
+        self.assertTrue(any("本机无鉴权转发" in item for item in logs))
+
+    def test_prepare_browser_proxy_plain_proxy_passthrough(self):
+        browser_proxy, key = flow._prepare_browser_proxy("http://1.2.3.4:8080")
+        self.assertEqual(browser_proxy, "http://1.2.3.4:8080")
+        self.assertEqual(key, "")
+
+    def test_build_turnstile_browser_options_rejects_auth_proxy(self):
+        class FakeOptions:
+            def __init__(self):
+                self.args = []
+                self.prefs = {}
+                self.proxy = ""
+
+            def set_argument(self, value):
+                self.args.append(value)
+
+            def set_pref(self, key, value):
+                self.prefs[key] = value
+
+            def set_proxy(self, value):
+                self.proxy = value
+
+            def set_local_port(self, port):
+                self.port = port
+
+        fake = FakeOptions()
+        with self.assertRaises(flow.XAIHttpFlowError) as ctx:
+            flow._build_turnstile_browser_options(
+                options=fake,
+                proxy="http://user:pass@gate.example:1000",
+                headless=False,
+                user_agent="",
+            )
+        self.assertIn("账号密码", str(ctx.exception))
+        self.assertEqual(fake.proxy, "")
+
+    def test_capture_turnstile_token_forwards_auth_proxy(self):
+        class FakeOptions:
+            def __init__(self):
+                self.args = []
+                self.prefs = {}
+                self.proxy = ""
+                self._xai_profile_dir = None
+
+            def set_argument(self, value):
+                self.args.append(value)
+
+            def set_pref(self, key, value):
+                self.prefs[key] = value
+
+            def set_proxy(self, value):
+                self.proxy = value
+
+            def set_local_port(self, port):
+                self.port = port
+
+            def set_user_data_path(self, path):
+                self._xai_profile_dir = path
+
+            def headless(self, value=True):
+                return None
+
+        class FakePage:
+            def __init__(self):
+                self.url = "https://accounts.x.ai/sign-up?redirect=grok-com"
+
+            def get(self, url):
+                self.url = url
+
+            def run_js(self, script):
+                if "tokenLen" in script or "cf-turnstile-response" in script:
+                    return {
+                        "url": self.url,
+                        "title": "ok",
+                        "tokenLen": 100,
+                        "sitekeyCount": 1,
+                        "hasCfInput": True,
+                        "turnstileIframeCount": 1,
+                        "token": "t" * 100,
+                        "inputs": {},
+                        "bodySnippet": "",
+                    }
+                return {"ok": True, "reason": "rendered", "tokenLen": 100, "token": "t" * 100}
+
+            @property
+            def wait(self):
+                class W:
+                    def doc_loaded(self_inner):
+                        return None
+                return W()
+
+        class FakeBrowser:
+            def __init__(self, options):
+                self.options = options
+                self.page = FakePage()
+
+            def get_tabs(self):
+                return [self.page]
+
+            def new_tab(self):
+                return self.page
+
+            def quit(self):
+                return None
+
+        logs = []
+        import types
+        fake_module = types.SimpleNamespace(Chromium=FakeBrowser, ChromiumOptions=FakeOptions)
+        with mock.patch.dict("sys.modules", {"DrissionPage": fake_module}), mock.patch.object(
+            flow,
+            "_prepare_browser_proxy",
+            return_value=("http://127.0.0.1:17991", "fwd-1"),
+        ) as prepare, mock.patch.object(
+            flow,
+            "_launch_turnstile_browser",
+            side_effect=lambda options, log_callback=None: FakeBrowser(options),
+        ), mock.patch.object(
+            flow,
+            "_resolve_local_browser_mode",
+            return_value=("headed", False),
+        ), mock.patch.object(
+            flow,
+            "_read_turnstile_token_js",
+            return_value="t" * 100,
+        ), mock.patch(
+            "local_proxy_forwarder.stop_local_forwarder"
+        ) as stop_fwd, mock.patch.object(flow.time, "sleep"):
+            token = flow.capture_turnstile_token(
+                proxy="http://user:pass@gate.example:1000",
+                timeout=5,
+                headless=False,
+                click_email_signup=False,
+                sitekey="0xhtml",
+                output="",
+                log_callback=logs.append,
+            )
+        self.assertEqual(token, "t" * 100)
+        prepare.assert_called_once()
+        stop_fwd.assert_called_once()
+        self.assertEqual(stop_fwd.call_args.kwargs.get("instance_key"), "fwd-1")
+
+
 if __name__ == "__main__":
     unittest.main()

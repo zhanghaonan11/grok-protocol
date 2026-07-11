@@ -453,6 +453,73 @@ def _parse_proxy_components(proxy: str) -> Dict[str, str]:
     }
 
 
+def _proxy_has_embedded_auth(proxy: str) -> bool:
+    """Return True when the proxy URL embeds username/password credentials."""
+    parts = _parse_proxy_components(proxy)
+    return bool(parts.get("username") or parts.get("password"))
+
+
+def _prepare_browser_proxy(
+    proxy: str = "",
+    *,
+    parent_proxy: str = "",
+    preferred_local_port: int = 0,
+    instance_key: str = "",
+    log_callback: LogFn = None,
+) -> Tuple[str, str]:
+    """Resolve a proxy URL that Chromium/DrissionPage can actually consume.
+
+    Chrome rejects ``http://user:pass@host:port`` with ``ERR_NO_SUPPORTED_PROXIES``.
+    When credentials (or a parent chain) are present, expose a local no-auth
+    forwarder on ``127.0.0.1`` and inject ``Proxy-Authorization`` upstream.
+
+    Returns ``(browser_proxy_url, forwarder_instance_key)``.
+    """
+    proxy = str(proxy or "").strip()
+    parent = str(parent_proxy or "").strip()
+    if not proxy and not parent:
+        return "", ""
+    if parent and not proxy:
+        raise XAIHttpFlowError("设置 parent_proxy 时必须同时提供上游 proxy")
+
+    # Local no-auth endpoints are already browser-safe.
+    parts = _parse_proxy_components(proxy)
+    host = str(parts.get("host") or "").lower()
+    if host in {"127.0.0.1", "localhost", "::1"} and not parent and not _proxy_has_embedded_auth(proxy):
+        return normalize_proxy(proxy), ""
+
+    needs_forwarder = bool(parent) or _proxy_has_embedded_auth(proxy)
+    if not needs_forwarder:
+        return normalize_proxy(proxy), ""
+
+    from local_proxy_forwarder import ensure_local_forwarder
+
+    key = str(instance_key or "").strip() or f"xai-ts-{os.getpid()}-{secrets.token_hex(3)}"
+    try:
+        browser_proxy, used = ensure_local_forwarder(
+            proxy,
+            preferred_local_port=int(preferred_local_port or 0),
+            instance_key=key,
+            parent_proxy_raw=parent,
+        )
+    except Exception as exc:
+        raise XAIHttpFlowError(f"本地代理转发启动失败: {exc}") from exc
+
+    browser_proxy = str(browser_proxy or "").strip()
+    if used:
+        up_desc = f"{parts.get('host')}:{parts.get('port')}" if parts.get("host") else "upstream"
+        _log(
+            log_callback,
+            f"[Turnstile] 账号密码代理已转本机无鉴权转发: {browser_proxy} -> {up_desc}",
+        )
+    elif _proxy_has_embedded_auth(browser_proxy):
+        # Safety net: never hand Chromium a credentialed URL.
+        raise XAIHttpFlowError(
+            "浏览器代理仍包含账号密码，无法设置；请检查 local_proxy_forwarder"
+        )
+    return browser_proxy, key if used else ""
+
+
 def _normalize_turnstile_provider(provider: str) -> str:
     """Normalize documented captcha-provider aliases to stable internal names."""
     provider = str(provider or "").strip().lower()
@@ -2909,6 +2976,17 @@ def _build_turnstile_browser_options(
 
     proxy = str(proxy or "").strip()
     if proxy:
+        # Chrome rejects credentialed proxy URLs (ERR_NO_SUPPORTED_PROXIES).
+        # Callers must pass a browser-safe endpoint (local forwarder) already.
+        if _proxy_has_embedded_auth(proxy):
+            _log(
+                log_callback,
+                "你似乎在设置使用账号密码的代理，暂时不支持这种代理，可自行用插件实现需求。",
+            )
+            raise XAIHttpFlowError(
+                "浏览器不支持带账号密码的代理 URL（ERR_NO_SUPPORTED_PROXIES）；"
+                "请先经 local_proxy_forwarder 转成本机无鉴权代理"
+            )
         set_proxy = getattr(options, "set_proxy", None)
         if not callable(set_proxy):
             raise XAIHttpFlowError("当前 ChromiumOptions 不支持 set_proxy，无法配置浏览器代理")
@@ -3728,42 +3806,54 @@ def capture_turnstile_token(
     except Exception as exc:  # pragma: no cover - depends on local install
         raise XAIHttpFlowError(f"turnstile-capture 需要 DrissionPage/Chrome: {exc}") from exc
 
-    want_headless = bool(headless)
-    mode, use_headless = _resolve_local_browser_mode(want_headless=want_headless)
-    virtual = _VirtualDisplaySession(log_callback=log_callback) if mode == "virtual-headed" else None
-    if virtual is not None:
-        if not virtual.start():
-            _log(log_callback, "[Turnstile][warn] 虚拟显示启动失败，回退 headless-new")
-            mode, use_headless = "headless-new", True
-            virtual = None
-    if mode == "virtual-headed":
-        _log(log_callback, "[Turnstile] 无头请求已映射为 virtual-headed（Xvfb 有界面，对 Cloudflare 更友好）")
-    elif mode == "headed" and want_headless:
-        _log(
-            log_callback,
-            "[Turnstile][warn] 未检测到 Xvfb；纯 headless 会被 x.ai 硬拦，"
-            "本次无头选项已自动改走本机有界面",
-        )
-    elif mode == "headless-new" and want_headless:
-        _log(
-            log_callback,
-            "[Turnstile][warn] 未检测到 Xvfb 且无 DISPLAY；只能试 headless-new，"
-            "很可能被 x.ai 硬拦截",
-        )
-
-    options = _build_turnstile_browser_options(
-        options=ChromiumOptions(),
-        proxy=proxy,
-        headless=bool(use_headless),
-        user_agent="",
-        log_callback=log_callback,
-    )
-
+    # Chromium cannot consume user:pass@host proxies.  Always resolve to a
+    # browser-safe endpoint first (local no-auth forwarder when needed).
+    selected_proxy_raw = str(selected_proxy_raw or proxy or "").strip()
+    browser_proxy = ""
+    forwarder_instance = ""
+    virtual = None
+    options = None
     browser = None
     page = None
     diag_samples: list[Dict[str, Any]] = []
     hard_block_retried = False
     try:
+        browser_proxy, forwarder_instance = _prepare_browser_proxy(
+            proxy,
+            log_callback=log_callback,
+        )
+        proxy = browser_proxy
+
+        want_headless = bool(headless)
+        mode, use_headless = _resolve_local_browser_mode(want_headless=want_headless)
+        virtual = _VirtualDisplaySession(log_callback=log_callback) if mode == "virtual-headed" else None
+        if virtual is not None:
+            if not virtual.start():
+                _log(log_callback, "[Turnstile][warn] 虚拟显示启动失败，回退 headless-new")
+                mode, use_headless = "headless-new", True
+                virtual = None
+        if mode == "virtual-headed":
+            _log(log_callback, "[Turnstile] 无头请求已映射为 virtual-headed（Xvfb 有界面，对 Cloudflare 更友好）")
+        elif mode == "headed" and want_headless:
+            _log(
+                log_callback,
+                "[Turnstile][warn] 未检测到 Xvfb；纯 headless 会被 x.ai 硬拦，"
+                "本次无头选项已自动改走本机有界面",
+            )
+        elif mode == "headless-new" and want_headless:
+            _log(
+                log_callback,
+                "[Turnstile][warn] 未检测到 Xvfb 且无 DISPLAY；只能试 headless-new，"
+                "很可能被 x.ai 硬拦截",
+            )
+
+        options = _build_turnstile_browser_options(
+            options=ChromiumOptions(),
+            proxy=proxy,
+            headless=bool(use_headless),
+            user_agent="",
+            log_callback=log_callback,
+        )
         _log(log_callback, f"[Turnstile] 正在启动浏览器 mode={mode} headless={use_headless}")
         browser = _launch_turnstile_browser(options, log_callback=log_callback)
         tabs = getattr(browser, "get_tabs", lambda: [])()
@@ -4102,6 +4192,13 @@ return true;
                 virtual.stop()
         except Exception:
             pass
+        if forwarder_instance:
+            try:
+                from local_proxy_forwarder import stop_local_forwarder
+
+                stop_local_forwarder(instance_key=forwarder_instance)
+            except Exception:
+                pass
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
