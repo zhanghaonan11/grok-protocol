@@ -31,8 +31,9 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = ROOT_DIR / "config.json"
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "xai_credentials"
+DEFAULT_EXPORT_DIR = ROOT_DIR / "exports"
 RUNS_DIR = ROOT_DIR / "http_runs"
-MAX_COUNT = 1000
+MAX_COUNT = 99999999
 MAX_WORKERS = 32
 MAX_LOCAL_TURNSTILE_WORKERS = 3  # default local Turnstile concurrency cap
 MIN_LOCAL_TURNSTILE_WORKERS = 1
@@ -1833,6 +1834,301 @@ def _proxy_file_path(settings: Settings) -> Path:
     return _absolute_path(raw, settings.config_path.parent)
 
 
+
+def _credential_single_line(text: object) -> str:
+    """Collapse credential/SSO payloads into one display line without losing characters."""
+    return (
+        str(text or "")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\n", "")
+    )
+
+
+def list_credential_pairs(
+    output_dir: Path,
+    *,
+    page: int = 1,
+    page_size: int = 1000,
+) -> Dict[str, object]:
+    """List credential JSON + matching SSO pairs as plain text lines.
+
+    Line format: ``<json-full-text>____<sso-full-text>``
+    Only ``*.json`` files are primary rows; missing ``.sso`` yields an empty right side.
+    """
+    directory = Path(output_dir).expanduser()
+    try:
+        directory = directory.resolve(strict=False)
+    except OSError:
+        directory = Path(output_dir).expanduser()
+
+    page_i = max(1, int(page or 1))
+    size_i = max(1, min(1000, int(page_size or 1000)))
+
+    rows: list[Dict[str, object]] = []
+    if directory.is_dir():
+        json_files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == ".json"]
+        json_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for json_path in json_files:
+            try:
+                json_text = json_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            sso_path = json_path.with_suffix(".sso")
+            sso_text = ""
+            if sso_path.is_file():
+                try:
+                    sso_text = sso_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    sso_text = ""
+            left = _credential_single_line(json_text)
+            right = _credential_single_line(sso_text)
+            rows.append(
+                {
+                    "name": json_path.stem,
+                    "json_name": json_path.name,
+                    "json_path": str(json_path),
+                    "sso_name": sso_path.name if sso_path.is_file() else "",
+                    "sso_path": str(sso_path) if sso_path.is_file() else "",
+                    "has_sso": bool(sso_path.is_file()),
+                    "mtime": float(json_path.stat().st_mtime),
+                    "line": f"{left}____{right}",
+                }
+            )
+
+    total = len(rows)
+    total_pages = max(1, (total + size_i - 1) // size_i) if total else 1
+    if page_i > total_pages:
+        page_i = total_pages
+    start = (page_i - 1) * size_i
+    end = start + size_i
+    page_rows = rows[start:end]
+    return {
+        "output_dir": str(directory),
+        "exists": directory.is_dir(),
+        "total": total,
+        "page": page_i,
+        "page_size": size_i,
+        "total_pages": total_pages,
+        "items": [
+            {
+                "name": r["name"],
+                "json_name": r["json_name"],
+                "json_path": r.get("json_path") or "",
+                "sso_name": r["sso_name"],
+                "sso_path": r.get("sso_path") or "",
+                "has_sso": r["has_sso"],
+                "line": r["line"],
+            }
+            for r in page_rows
+        ],
+        "text": "\n".join(str(r["line"]) for r in page_rows),
+    }
+
+
+
+
+def export_credential_page_and_delete(
+    output_dir: Path,
+    *,
+    page: int = 1,
+    page_size: int = 1000,
+    export_dir: Path | None = None,
+) -> Dict[str, object]:
+    """Export current credential page to ``grok+{timestamp}.txt``, then delete sources.
+
+    Safety order:
+    1) build page rows
+    2) write export file
+    3) verify file content
+    4) delete only the json/sso files belonging to that page
+    """
+    from datetime import datetime
+
+    page_data = list_credential_pairs(output_dir, page=page, page_size=page_size)
+    items = list(page_data.get("items") or [])
+    if not items:
+        raise TuiConfigError("当前页没有可导出的凭证")
+
+    lines = [str(item.get("line") or "") for item in items]
+    payload = "\n".join(lines)
+    if payload and not payload.endswith("\n"):
+        payload += "\n"
+
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    filename = f"grok+{stamp}.txt"
+    target_dir = Path(export_dir or resolve_export_dir(ROOT_DIR)).expanduser()
+    try:
+        target_dir = target_dir.resolve(strict=False)
+    except OSError:
+        target_dir = Path(export_dir or resolve_export_dir(ROOT_DIR)).expanduser()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    export_path = target_dir / filename
+
+    try:
+        export_path.write_text(payload, encoding="utf-8")
+    except OSError as exc:
+        raise TuiConfigError(f"导出文件写入失败: {exc}") from exc
+
+    try:
+        written = export_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise TuiConfigError(f"导出后校验读取失败，已中止删除本地凭证: {exc}") from exc
+    if written != payload:
+        raise TuiConfigError("导出后内容校验不一致，已中止删除本地凭证")
+
+    # Only delete files under the credential output directory.
+    cred_dir = Path(page_data.get("output_dir") or output_dir).expanduser()
+    try:
+        cred_dir = cred_dir.resolve(strict=False)
+    except OSError:
+        pass
+    deleted: list[str] = []
+    delete_errors: list[str] = []
+    for item in items:
+        for key in ("json_path", "sso_path"):
+            raw = str(item.get(key) or "").strip()
+            if not raw:
+                continue
+            path_obj = Path(raw)
+            try:
+                resolved = path_obj.resolve(strict=False)
+            except OSError:
+                resolved = path_obj
+            try:
+                resolved.relative_to(cred_dir)
+            except ValueError:
+                delete_errors.append(f"拒绝删除目录外文件: {resolved}")
+                continue
+            if not resolved.is_file():
+                continue
+            try:
+                resolved.unlink()
+                deleted.append(str(resolved))
+            except OSError as exc:
+                delete_errors.append(f"{resolved.name}: {exc}")
+
+    return {
+        "ok": True,
+        "filename": filename,
+        "path": str(export_path),
+        "export_dir": str(target_dir),
+        "page": int(page_data.get("page") or page),
+        "page_size": int(page_data.get("page_size") or page_size),
+        "exported_count": len(items),
+        "deleted_count": len(deleted),
+        "deleted": deleted,
+        "delete_errors": delete_errors,
+        "text": payload,
+        "output_dir": str(cred_dir),
+    }
+
+
+
+def resolve_export_dir(root_dir: Path | None = None) -> Path:
+    """Dedicated folder for grok+timestamp.txt exports."""
+    root = Path(root_dir or ROOT_DIR)
+    export_dir = (root / "exports").expanduser()
+    try:
+        export_dir = export_dir.resolve(strict=False)
+    except OSError:
+        pass
+    export_dir.mkdir(parents=True, exist_ok=True)
+    # Soft-migrate legacy root-level export files once.
+    try:
+        for legacy in root.glob("grok+*.txt"):
+            if not legacy.is_file():
+                continue
+            target = export_dir / legacy.name
+            if target.exists():
+                continue
+            try:
+                legacy.replace(target)
+            except OSError:
+                try:
+                    target.write_bytes(legacy.read_bytes())
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return export_dir
+
+
+def _is_safe_export_name(name: str) -> bool:
+    text = str(name or "").strip()
+    if not text or "/" in text or "\\" in text or text in {".", ".."}:
+        return False
+    # Only plain export text files.
+    if not text.endswith(".txt"):
+        return False
+    if text.startswith("."):
+        return False
+    return True
+
+
+def resolve_export_file(root_dir: Path | None, name: str) -> Path:
+    export_dir = resolve_export_dir(root_dir)
+    filename = str(name or "").strip()
+    if not _is_safe_export_name(filename):
+        raise TuiConfigError("非法导出文件名")
+    path = (export_dir / filename).resolve(strict=False)
+    try:
+        path.relative_to(export_dir.resolve(strict=False))
+    except Exception as exc:
+        raise TuiConfigError("非法导出路径") from exc
+    return path
+
+
+def list_export_files(root_dir: Path | None = None) -> Dict[str, object]:
+    export_dir = resolve_export_dir(root_dir)
+    files = []
+    for path in export_dir.glob("*.txt"):
+        if not path.is_file():
+            continue
+        if not _is_safe_export_name(path.name):
+            continue
+        try:
+            st = path.stat()
+            size = int(st.st_size)
+            mtime = float(st.st_mtime)
+        except OSError:
+            continue
+        # line count best-effort
+        lines = 0
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for lines, _ in enumerate(fh, 1):
+                    pass
+        except OSError:
+            lines = 0
+        files.append(
+            {
+                "name": path.name,
+                "path": str(path),
+                "size": size,
+                "mtime": mtime,
+                "line_count": lines,
+            }
+        )
+    files.sort(key=lambda x: float(x.get("mtime") or 0), reverse=True)
+    return {
+        "export_dir": str(export_dir),
+        "exists": export_dir.is_dir(),
+        "total": len(files),
+        "items": files,
+    }
+
+
+def delete_export_file(root_dir: Path | None, name: str) -> Dict[str, object]:
+    path = resolve_export_file(root_dir, name)
+    if not path.is_file():
+        raise TuiConfigError(f"导出文件不存在: {name}")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise TuiConfigError(f"删除导出文件失败: {exc}") from exc
+    return {"ok": True, "deleted": path.name, "export_dir": str(path.parent)}
+
 def read_proxy_pool_text(settings: Settings) -> Dict[str, object]:
     path = _proxy_file_path(settings)
     text_value = ""
@@ -2453,6 +2749,31 @@ class BatchService:
             _load_runtime_fields(self.settings)
         return self.get_config_center()
 
+    def list_credentials(self, *, page: int = 1, page_size: int = 1000) -> Dict[str, object]:
+        """Return paginated plaintext credential lines from the OAuth output directory."""
+        return list_credential_pairs(self.settings.output_dir, page=page, page_size=page_size)
+
+    def export_dir(self) -> Path:
+        return resolve_export_dir(self.root_dir)
+
+    def export_credentials_page(self, *, page: int = 1, page_size: int = 1000) -> Dict[str, object]:
+        """Export one credentials page to exports/grok+timestamp.txt, then delete local pairs."""
+        return export_credential_page_and_delete(
+            self.settings.output_dir,
+            page=page,
+            page_size=page_size,
+            export_dir=self.export_dir(),
+        )
+
+    def list_export_files(self) -> Dict[str, object]:
+        return list_export_files(self.root_dir)
+
+    def delete_export_file(self, name: str) -> Dict[str, object]:
+        return delete_export_file(self.root_dir, name)
+
+    def resolve_export_file(self, name: str) -> Path:
+        return resolve_export_file(self.root_dir, name)
+
     def get_proxy_pool(self) -> Dict[str, object]:
         return read_proxy_pool_text(self.settings)
 
@@ -2928,6 +3249,12 @@ class BatchService:
 
     def attach_log_listener(self, callback: Callable[[str], None]) -> None:
         self._listeners.append(callback)
+
+    def detach_log_listener(self, callback: Callable[[str], None]) -> None:
+        try:
+            self._listeners.remove(callback)
+        except ValueError:
+            pass
 
     def _emit_log(self, line: str) -> None:
         for callback in list(self._listeners):

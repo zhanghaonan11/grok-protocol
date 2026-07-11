@@ -4,6 +4,21 @@ const message = $("message");
 const logBox = $("logBox");
 let es = null;
 
+// ---- UI performance: buffer logs / throttle snapshot ----
+const LOG_MAX_LINES = 400;
+const SNAPSHOT_MIN_INTERVAL_MS = 500;
+const LOG_FLUSH_MS = 100;
+const WORKER_RENDER_LIMIT = 24;
+
+let logLines = [];
+let logPending = [];
+let logFlushTimer = null;
+let lastSnapshotAt = 0;
+let pendingSnapshot = null;
+let snapshotTimer = null;
+let esReconnectTimer = null;
+let esShouldRun = false;
+
 function setMsg(text, isError=false) {
   message.textContent = text || "";
   message.style.color = isError ? "#ff6b6b" : "#f0b429";
@@ -57,13 +72,44 @@ async function loadSettings() {
   fillForm(data);
 }
 
-function appendLog(line) {
-  logBox.textContent += line + "\n";
-  const lines = logBox.textContent.split("\n");
-  if (lines.length > 800) logBox.textContent = lines.slice(-800).join("\n");
-  if ($("autoScroll").checked) logBox.scrollTop = logBox.scrollHeight;
+function flushLogs() {
+  logFlushTimer = null;
+  if (!logPending.length || !logBox) return;
+  const stick =
+    $("autoScroll") &&
+    $("autoScroll").checked &&
+    (logBox.scrollTop + logBox.clientHeight >= logBox.scrollHeight - 40);
+  for (const line of logPending) logLines.push(line);
+  logPending = [];
+  if (logLines.length > LOG_MAX_LINES) {
+    logLines = logLines.slice(-LOG_MAX_LINES);
+  }
+  // One DOM write per batch.
+  logBox.textContent = logLines.join("\n") + (logLines.length ? "\n" : "");
+  if (stick) logBox.scrollTop = logBox.scrollHeight;
 }
 
+function appendLog(line) {
+  if (!line) return;
+  logPending.push(String(line));
+  // Cap pending to avoid memory blowup if tab is backgrounded.
+  if (logPending.length > 1000) {
+    logPending = logPending.slice(-500);
+  }
+  if (!logFlushTimer) {
+    logFlushTimer = setTimeout(flushLogs, LOG_FLUSH_MS);
+  }
+}
+
+function clearLogs() {
+  logLines = [];
+  logPending = [];
+  if (logFlushTimer) {
+    clearTimeout(logFlushTimer);
+    logFlushTimer = null;
+  }
+  if (logBox) logBox.textContent = "";
+}
 
 function formatElapsed(sec) {
   const n = Math.max(0, Number(sec) || 0);
@@ -83,8 +129,9 @@ function formatRate(v) {
   return `${(Number(v) * 100).toFixed(1)}%`;
 }
 
-function renderSnapshot(snap) {
+function renderSnapshotNow(snap) {
   if (!snap) return;
+  lastSnapshotAt = Date.now();
   const total = snap.count || 0;
   const done = (snap.completed || 0);
   const pct = total ? Math.round(done * 100 / total) : 0;
@@ -96,15 +143,35 @@ function renderSnapshot(snap) {
   $("failureBox").textContent = Object.keys(fc).length
     ? Object.entries(fc).map(([k,v]) => `${k}: ${v}`).join("\n")
     : "-";
-  const workers = snap.workers || [];
-  $("workerTable").textContent = workers.length
-    ? workers.map(w => `W${String(w.index).padStart(2,"0")} ${w.status} | ${w.last_log || ""}`).join("\n")
-    : "-";
+
+  const workers = Array.isArray(snap.workers) ? snap.workers : [];
+  // Prefer active/failed first, keep DOM small.
+  const ranked = workers.slice().sort((a, b) => {
+    const rank = (w) => {
+      const s = String(w.status || "");
+      if (s === "running" || s === "active") return 0;
+      if (s === "failed") return 1;
+      if (s === "queued") return 2;
+      if (s === "succeeded") return 3;
+      return 4;
+    };
+    return rank(a) - rank(b) || (a.index || 0) - (b.index || 0);
+  });
+  const shown = ranked.slice(0, WORKER_RENDER_LIMIT);
+  const extra = workers.length - shown.length;
+  const body = shown.map((w) => {
+    const log = String(w.last_log || "").replace(/\s+/g, " ").slice(0, 120);
+    return `W${String(w.index).padStart(2,"0")} ${w.status || "-"} | ${log}`;
+  });
+  if (extra > 0) body.push(`... 另有 ${extra} 个 worker 未展开`);
+  $("workerTable").textContent = body.length ? body.join("\n") : "-";
+
   const badge = $("busyBadge");
   if (snap.done) {
     badge.textContent = "已完成";
     badge.className = "badge";
     setFormDisabled(false);
+    esShouldRun = false;
   } else if (snap.started) {
     badge.textContent = snap.stopping ? "停止中" : "运行中";
     badge.className = "badge run";
@@ -112,42 +179,109 @@ function renderSnapshot(snap) {
   }
 }
 
+function renderSnapshot(snap) {
+  if (!snap) return;
+  const now = Date.now();
+  // Always apply terminal states immediately.
+  if (snap.done || !lastSnapshotAt || now - lastSnapshotAt >= SNAPSHOT_MIN_INTERVAL_MS) {
+    pendingSnapshot = null;
+    if (snapshotTimer) {
+      clearTimeout(snapshotTimer);
+      snapshotTimer = null;
+    }
+    renderSnapshotNow(snap);
+    return;
+  }
+  pendingSnapshot = snap;
+  if (!snapshotTimer) {
+    snapshotTimer = setTimeout(() => {
+      snapshotTimer = null;
+      if (pendingSnapshot) {
+        const s = pendingSnapshot;
+        pendingSnapshot = null;
+        renderSnapshotNow(s);
+      }
+    }, SNAPSHOT_MIN_INTERVAL_MS - (now - lastSnapshotAt));
+  }
+}
+
 function setFormDisabled(disabled) {
   [...form.elements].forEach(el => el.disabled = disabled);
 }
 
+function disconnectEvents() {
+  esShouldRun = false;
+  if (esReconnectTimer) {
+    clearTimeout(esReconnectTimer);
+    esReconnectTimer = null;
+  }
+  if (es) {
+    try { es.close(); } catch {}
+    es = null;
+  }
+}
+
 function connectEvents() {
-  if (es) es.close();
+  disconnectEvents();
+  esShouldRun = true;
   es = new EventSource("/api/runs/current/events");
-  es.addEventListener("snapshot", (e) => renderSnapshot(JSON.parse(e.data)));
+  es.addEventListener("snapshot", (e) => {
+    try { renderSnapshot(JSON.parse(e.data)); }
+    catch {}
+  });
   es.addEventListener("log", (e) => {
-    const data = JSON.parse(e.data);
-    appendLog(data.line || "");
+    try {
+      const data = JSON.parse(e.data);
+      appendLog(data.line || "");
+    } catch {
+      appendLog(e.data || "");
+    }
   });
   es.addEventListener("done", (e) => {
-    renderSnapshot(JSON.parse(e.data));
-    es.close();
-    refreshHistory();
+    try { renderSnapshot(JSON.parse(e.data)); }
+    catch {}
+    disconnectEvents();
+    refreshHistory().catch(() => {});
   });
   es.onerror = () => {
-    // browser will retry; keep quiet
+    // Browser auto-reconnects EventSource; avoid stacking custom loops unless closed.
+    if (!esShouldRun) return;
+    if (es && es.readyState === EventSource.CLOSED) {
+      if (esReconnectTimer) return;
+      esReconnectTimer = setTimeout(() => {
+        esReconnectTimer = null;
+        if (esShouldRun) connectEvents();
+      }, 1500);
+    }
   };
 }
 
 async function refreshHistory() {
-  const data = await api("/api/runs?limit=30");
+  const data = await api("/api/runs?limit=20");
   const box = $("historyList");
   box.innerHTML = "";
+  const frag = document.createDocumentFragment();
   (data.runs || []).forEach(run => {
     const div = document.createElement("div");
     div.className = "hist-item";
     div.innerHTML = `<span>${run.run_id}</span><span>成功${run.succeeded || 0}/失败${run.failed || 0}</span>`;
     div.onclick = async () => {
-      const detail = await api(`/api/runs/${encodeURIComponent(run.run_id)}`);
-      $("historyDetail").textContent = JSON.stringify(detail, null, 2);
+      try {
+        const detail = await api(`/api/runs/${encodeURIComponent(run.run_id)}`);
+        // Keep history detail light: drop huge nested blobs if present.
+        const slim = {
+          run_id: detail.run_id || run.run_id,
+          summary: detail.summary || detail,
+          files: (detail.files || []).slice(0, 30),
+        };
+        $("historyDetail").textContent = JSON.stringify(slim, null, 2);
+      } catch (e) {
+        $("historyDetail").textContent = String(e.message || e);
+      }
     };
-    box.appendChild(div);
+    frag.appendChild(div);
   });
+  box.appendChild(frag);
 }
 
 $("btnReload").onclick = async () => {
@@ -201,7 +335,7 @@ $("btnCleanup").onclick = async () => {
   } catch (e) { setMsg(String(e.message || e), true); }
 };
 
-$("btnClearLog").onclick = () => { logBox.textContent = ""; };
+$("btnClearLog").onclick = () => { clearLogs(); };
 $("btnRefreshHistory").onclick = () => refreshHistory().catch(e => setMsg(String(e.message || e), true));
 
 
@@ -230,9 +364,24 @@ function renderEmbeddedProxyStatus(data) {
       ` | ${running ? "运行中" : "未运行"} | 健康 ${healthy}/${total} | 租约 ${leases}` +
       (message ? ` | ${message}` : "");
   }
+  // Run console only needs a compact view; full node dump freezes the page.
   if (box) {
-    try { box.textContent = JSON.stringify(data, null, 2); }
-    catch { box.textContent = String(data); }
+    const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+    const top = nodes.slice(0, 8).map((n, i) => {
+      const name = String(n.name || n.id || "-").slice(0, 40);
+      const h = n.healthy ? "Y" : "n";
+      const sc = n.success_count == null ? "-" : n.success_count;
+      const fc = n.fail_count == null ? "-" : n.fail_count;
+      return `${i + 1}. [${h}] ${name} ok=${sc} fail=${fc}`;
+    });
+    const lines = [
+      `phase=${phase} running=${running} healthy=${healthy}/${total} leases=${leases}`,
+      message ? `message=${message}` : "",
+      top.length ? "nodes:" : "nodes: -",
+      ...top,
+      nodes.length > 8 ? `... 另有 ${nodes.length - 8} 个节点` : "",
+    ].filter(Boolean);
+    box.textContent = lines.join("\n");
   }
   if (badge) {
     let label = `内嵌代理: ${phaseText}`;
@@ -242,13 +391,13 @@ function renderEmbeddedProxyStatus(data) {
     if (phase === "ready" && running) badge.classList.add("good");
     else if (phase === "starting") badge.classList.add("warn");
     else if (phase === "error") badge.classList.add("err");
-    else if (phase === "disabled") badge.classList.add("");
   }
 }
 
 async function refreshEmbeddedProxyStatus() {
   try {
-    const data = await api("/api/embedded-proxy/status");
+    // compact=1 avoids huge node payloads on the run console.
+    const data = await api("/api/embedded-proxy/status?compact=1");
     renderEmbeddedProxyStatus(data || {});
     return data;
   } catch (e) {
@@ -272,11 +421,11 @@ function startEmbeddedProxyPolling() {
     try {
       const data = await refreshEmbeddedProxyStatus();
       const phase = String((data && data.phase) || "");
-      // Keep polling while starting; slow down when stable.
-      const delay = phase === "starting" ? 1200 : 5000;
+      // Slower polling on run console to keep UI responsive during batches.
+      const delay = phase === "starting" ? 2000 : 8000;
       embeddedPollTimer = setTimeout(tick, delay);
     } catch {
-      embeddedPollTimer = setTimeout(tick, 5000);
+      embeddedPollTimer = setTimeout(tick, 8000);
     }
   };
   tick();

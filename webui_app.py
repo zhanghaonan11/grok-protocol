@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -110,6 +110,10 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
     def config_page(request: Request) -> HTMLResponse:
         return _page(request, "config.html", "config")
 
+    @app.get("/credentials", response_class=HTMLResponse)
+    def credentials_page(request: Request) -> HTMLResponse:
+        return _page(request, "credentials.html", "credentials")
+
     @app.get("/api/health")
     def health() -> Dict[str, Any]:
         svc = get_service()
@@ -156,6 +160,102 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
         try:
             return get_service().update_config_center(payload or {})
         except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+
+    @app.get("/api/credentials")
+    def credentials_list(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(1000, ge=1, le=1000),
+    ) -> Dict[str, Any]:
+        """Plaintext credential browser for config-center right panel."""
+        try:
+            return get_service().list_credentials(page=page, page_size=page_size)
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+
+    @app.post("/api/credentials/export-page")
+    def credentials_export_page(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Export current credentials page to grok+timestamp.txt, then delete local pairs."""
+        data = dict(payload or {})
+        page = int(data.get("page") or 1)
+        page_size = int(data.get("page_size") or 1000)
+        page = max(1, page)
+        page_size = max(1, min(1000, page_size))
+        try:
+            return get_service().export_credentials_page(page=page, page_size=page_size)
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+
+
+    @app.get("/api/credential-exports")
+    def credential_exports_list() -> Dict[str, Any]:
+        try:
+            return get_service().list_export_files()
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+
+    @app.get("/api/credential-exports/preview")
+    def credential_exports_preview(
+        name: str = Query(..., min_length=1),
+        max_chars: int = Query(300000, ge=1000, le=2000000),
+    ) -> Dict[str, Any]:
+        """Return export txt content for in-page historical viewing."""
+        try:
+            path = get_service().resolve_export_file(name)
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+        if not path.is_file():
+            raise _err(TuiConfigError("导出文件不存在"), 404)
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise _err(TuiConfigError(f"读取导出文件失败: {exc}"), 400) from exc
+        limit = max(1000, min(int(max_chars or 300000), 2000000))
+        truncated = len(raw) > limit
+        text = raw[:limit]
+        line_count = raw.count("\n") + (0 if raw.endswith("\n") or not raw else 1)
+        return {
+            "ok": True,
+            "name": path.name,
+            "path": str(path),
+            "size": path.stat().st_size,
+            "line_count": line_count,
+            "truncated": truncated,
+            "max_chars": limit,
+            "text": text,
+        }
+
+    @app.get("/api/credential-exports/download")
+    def credential_exports_download(name: str = Query(..., min_length=1)) -> FileResponse:
+        try:
+            path = get_service().resolve_export_file(name)
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+        if not path.is_file():
+            raise _err(TuiConfigError("导出文件不存在"), 404)
+        return FileResponse(
+            path=str(path),
+            filename=path.name,
+            media_type="text/plain; charset=utf-8",
+        )
+
+    @app.delete("/api/credential-exports")
+    def credential_exports_delete(name: str = Query(..., min_length=1)) -> Dict[str, Any]:
+        try:
+            return get_service().delete_export_file(name)
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
             raise _err(exc, 400) from exc
 
     @app.get("/api/proxy-pool")
@@ -220,11 +320,41 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
 
 
     @app.get("/api/embedded-proxy/status")
-    def embedded_proxy_status() -> Dict[str, Any]:
+    def embedded_proxy_status(compact: bool = Query(False)) -> Dict[str, Any]:
         try:
-            return get_service().get_embedded_proxy_status()
+            data = get_service().get_embedded_proxy_status()
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
+        if not compact or not isinstance(data, dict):
+            return data
+        # Run console only needs lightweight fields.
+        nodes = data.get("nodes") if isinstance(data.get("nodes"), list) else []
+        slim_nodes = []
+        for n in nodes[:8]:
+            if not isinstance(n, dict):
+                continue
+            slim_nodes.append(
+                {
+                    "id": n.get("id"),
+                    "name": n.get("name"),
+                    "healthy": n.get("healthy"),
+                    "success_count": n.get("success_count"),
+                    "fail_count": n.get("fail_count"),
+                    "ref_count": n.get("ref_count"),
+                    "local_http": n.get("local_http"),
+                }
+            )
+        return {
+            "enabled": data.get("enabled"),
+            "running": data.get("running"),
+            "phase": data.get("phase"),
+            "message": data.get("message"),
+            "healthy": data.get("healthy"),
+            "total": data.get("total"),
+            "leases": data.get("leases"),
+            "last_error": data.get("last_error"),
+            "nodes": slim_nodes,
+        }
 
     @app.post("/api/embedded-proxy/start")
     def embedded_proxy_start(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -317,41 +447,105 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
     async def runs_events() -> StreamingResponse:
         svc = get_service()
         _ensure_poller(svc)
-        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=500)
+        # Smaller queue: drop oldest logs under pressure instead of freezing UI/server.
+        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=200)
         loop = asyncio.get_running_loop()
+        closed = {"v": False}
+
+        def _ui_snapshot(snap: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+            if not isinstance(snap, dict):
+                return {"done": True, "workers": [], "failure_counts": {}}
+            workers = snap.get("workers") if isinstance(snap.get("workers"), list) else []
+            slim_workers = []
+            for w in workers:
+                if not isinstance(w, dict):
+                    continue
+                last_log = str(w.get("last_log") or "")
+                if len(last_log) > 160:
+                    last_log = last_log[:160]
+                slim_workers.append(
+                    {
+                        "index": w.get("index"),
+                        "status": w.get("status"),
+                        "last_log": last_log,
+                        "return_code": w.get("return_code"),
+                    }
+                )
+            return {
+                "run_id": snap.get("run_id"),
+                "started": snap.get("started"),
+                "done": snap.get("done"),
+                "stopping": snap.get("stopping"),
+                "count": snap.get("count"),
+                "completed": snap.get("completed"),
+                "succeeded": snap.get("succeeded"),
+                "failed": snap.get("failed"),
+                "active": snap.get("active"),
+                "elapsed_sec": snap.get("elapsed_sec"),
+                "avg_success_per_min": snap.get("avg_success_per_min"),
+                "success_rate": snap.get("success_rate"),
+                "failure_counts": snap.get("failure_counts") or {},
+                "workers": slim_workers,
+            }
 
         def on_log(line: str) -> None:
+            if closed["v"]:
+                return
             payload = json.dumps({"line": line}, ensure_ascii=False)
-            msg = f"event: log\ndata: {payload}\n\n"
+            msg = "event: log\ndata: " + payload + "\n\n"
+
+            def _put() -> None:
+                if closed["v"]:
+                    return
+                try:
+                    queue.put_nowait(msg)
+                except asyncio.QueueFull:
+                    try:
+                        queue.get_nowait()
+                    except Exception:
+                        return
+                    try:
+                        queue.put_nowait(msg)
+                    except Exception:
+                        pass
+
             try:
-                loop.call_soon_threadsafe(queue.put_nowait, msg)
+                loop.call_soon_threadsafe(_put)
             except Exception:
                 pass
 
         svc.attach_log_listener(on_log)
 
         async def gen():
-            snap = svc.current_snapshot() or {"done": True, "workers": [], "failure_counts": {}}
-            yield f"event: snapshot\ndata: {json.dumps(snap, ensure_ascii=False)}\n\n"
-            last_snap = time.monotonic()
-            while True:
-                if queue.empty():
-                    await asyncio.sleep(0.2)
-                else:
+            try:
+                snap = _ui_snapshot(svc.current_snapshot())
+                yield "event: snapshot\ndata: " + json.dumps(snap, ensure_ascii=False) + "\n\n"
+                last_snap = time.monotonic()
+                while True:
                     try:
-                        while True:
-                            yield queue.get_nowait()
-                    except asyncio.QueueEmpty:
+                        msg = await asyncio.wait_for(queue.get(), timeout=0.35)
+                        yield msg
+                        for _ in range(40):
+                            try:
+                                yield queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                    except asyncio.TimeoutError:
                         pass
-                now = time.monotonic()
-                if now - last_snap >= 0.4:
-                    snap = svc.current_snapshot()
-                    if snap is not None:
-                        yield f"event: snapshot\ndata: {json.dumps(snap, ensure_ascii=False)}\n\n"
+                    now = time.monotonic()
+                    if now - last_snap >= 1.0:
+                        snap = _ui_snapshot(svc.current_snapshot())
+                        yield "event: snapshot\ndata: " + json.dumps(snap, ensure_ascii=False) + "\n\n"
                         if snap.get("done"):
-                            yield f"event: done\ndata: {json.dumps(snap, ensure_ascii=False)}\n\n"
+                            yield "event: done\ndata: " + json.dumps(snap, ensure_ascii=False) + "\n\n"
                             break
-                    last_snap = now
+                        last_snap = now
+            finally:
+                closed["v"] = True
+                try:
+                    svc.detach_log_listener(on_log)
+                except Exception:
+                    pass
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 

@@ -195,3 +195,162 @@ label.check .field-title {
 .badge.warn { background: #3a2a12; color: var(--warn); }
 .badge.err { background: #3a1717; color: var(--bad); }
 .badge.good { background: #173528; color: var(--good); }
+
+
+/* Config center: left settings + right credentials browser */
+.config-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(340px, 0.95fr);
+  gap: 12px;
+  padding: 12px;
+  align-items: start;
+}
+.config-left {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr;
+}
+.config-left .panel.wide { grid-column: auto; }
+.config-right {
+  position: sticky;
+  top: 12px;
+  align-self: start;
+}
+.credentials-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: calc(100vh - 24px);
+  min-height: 520px;
+}
+.cred-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+}
+.credentials-list {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 360px;
+  max-height: calc(100vh - 220px);
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: pre;
+  overflow: auto;
+}
+.cred-pager {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.cred-page-jump {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.cred-page-jump input {
+  width: 72px;
+  padding: 6px 8px;
+}
+@media (max-width: 1100px) {
+  .config-layout {
+    grid-template-columns: 1fr;
+  }
+  .config-right {
+    position: static;
+  }
+  .credentials-panel {
+    max-height: none;
+  }
+  .credentials-list {
+    max-height: 480px;
+  }
+}
+
+
+/* Standalone credentials page */
+.credentials-page {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: calc(100vh - 96px);
+}
+.credentials-list-full {
+  flex: 1 1 auto;
+  min-height: 60vh;
+  max-height: none;
+  height: calc(100vh - 260px);
+}
+
+
+
+.export-table-wrap {
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0c1015;
+}
+.export-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.export-table th,
+.export-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: middle;
+}
+.export-table th {
+  color: var(--muted);
+  font-weight: 600;
+  background: #121821;
+  position: sticky;
+  top: 0;
+}
+.export-table tr:last-child td { border-bottom: 0; }
+.export-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.export-actions a,
+.export-actions button {
+  font-size: 12px;
+  padding: 6px 10px;
+}
+
+
+.export-preview {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.export-preview-text {
+  min-height: 240px;
+  max-height: 48vh;
+  height: 320px;
+}
+.export-table tr.is-active td {
+  background: #17304f;
+}
+
+/* Run console responsiveness */
+.log {
+  content-visibility: auto;
+  contain-intrinsic-size: 280px;
+  will-change: contents;
+}
+#workerTable, #embeddedProxyStatusRun, #failureBox {
+  content-visibility: auto;
+}
