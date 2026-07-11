@@ -44,7 +44,14 @@
           </select>
         </label>
         <label class="check"><input type="checkbox" name="turnstile_headless" /> 无头(local→Xvfb virtual-headed)</label>
-        <label>注册数量 <input type="number" name="count" min="1" max="99999999" value="1" /></label>
+        <label>目标模式
+          <select name="target_mode" id="targetMode">
+            <option value="count">固定数量</option>
+            <option value="continuous">持续运行</option>
+          </select>
+        </label>
+        <label id="countField">注册数量 <input type="number" name="count" min="1" max="99999999" value="1" /></label>
+        <label id="targetSuccessField" style="display:none">成功目标(0=不限) <input type="number" name="target_success" min="0" max="99999999" value="0" /></label>
         <label>并发数 <input type="number" name="workers" min="1" max="32" value="1" /></label>
         <label>代理模式
           <select name="proxy_mode">

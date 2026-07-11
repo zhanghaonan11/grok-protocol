@@ -24,12 +24,22 @@ function setMsg(text, isError=false) {
   message.style.color = isError ? "#ff6b6b" : "#f0b429";
 }
 
+function syncTargetModeFields() {
+  const mode = form.target_mode ? form.target_mode.value : "count";
+  const countField = $("countField");
+  const targetField = $("targetSuccessField");
+  if (countField) countField.style.display = mode === "continuous" ? "none" : "";
+  if (targetField) targetField.style.display = mode === "continuous" ? "" : "none";
+}
+
 function formData() {
   const fd = new FormData(form);
   return {
     run_mode: fd.get("run_mode"),
     turnstile_provider: fd.get("turnstile_provider"),
     turnstile_headless: form.turnstile_headless.checked,
+    target_mode: fd.get("target_mode") || "count",
+    target_success: Number(fd.get("target_success") || 0),
     count: Number(fd.get("count") || 1),
     workers: Number(fd.get("workers") || 1),
     proxy_mode: fd.get("proxy_mode"),
@@ -43,6 +53,8 @@ function fillForm(data) {
   form.run_mode.value = data.run_mode || "register_otp";
   form.turnstile_provider.value = data.turnstile_provider || "local";
   form.turnstile_headless.checked = !!data.turnstile_headless;
+  if (form.target_mode) form.target_mode.value = data.target_mode || data.run_target_mode || "count";
+  if (form.target_success) form.target_success.value = data.target_success != null ? data.target_success : 0;
   form.count.value = data.count || 1;
   form.workers.value = data.workers || 1;
   form.proxy_mode.value = data.proxy_mode || "auto";
@@ -50,6 +62,7 @@ function fillForm(data) {
   form.sso_convert_retries.value = data.sso_convert_retries || 5;
   form.sso_convert_cooldown.value = data.sso_convert_cooldown || 3;
   $("emailProvider").textContent = "邮箱: " + (data.email_provider || (data.config && data.config.email_provider) || "-");
+  syncTargetModeFields();
 }
 
 async function api(path, opts={}) {
@@ -71,6 +84,8 @@ async function loadSettings() {
   const data = await api("/api/settings");
   fillForm(data);
 }
+
+if (form.target_mode) form.target_mode.onchange = syncTargetModeFields;
 
 function flushLogs() {
   logFlushTimer = null;
@@ -138,14 +153,30 @@ function formatRate(v) {
 function renderSnapshotNow(snap) {
   if (!snap) return;
   lastSnapshotAt = Date.now();
+  const mode = String(snap.target_mode || "count");
   const total = snap.count || 0;
   const done = (snap.completed || 0);
-  const pct = total ? Math.round(done * 100 / total) : 0;
+  const startedTasks = Number(snap.started_tasks != null ? snap.started_tasks : done);
+  let pct = 0;
+  if (mode === "continuous") {
+    const target = Number(snap.target_success || 0);
+    pct = target > 0 ? Math.min(100, Math.round((snap.succeeded || 0) * 100 / target)) : Math.min(100, Number(snap.active || 0) > 0 ? 15 : (done ? 100 : 0));
+  } else {
+    pct = total ? Math.round(done * 100 / total) : 0;
+  }
   $("progressBar").style.width = pct + "%";
   const stopped = Number(snap.stopped || 0);
   const stopPart = stopped > 0 ? ` | 停止 ${stopped}` : "";
-  const line1 = `run=${snap.run_id || "-"} | 完成 ${done}/${total} | 成功 ${snap.succeeded || 0} | 失败 ${snap.failed || 0}${stopPart} | 活动 ${snap.active || 0}`;
-  const line2 = `速度 ${formatSpeed(snap.avg_success_per_min)} | 成功率 ${formatRate(snap.success_rate)} | 耗时 ${formatElapsed(snap.elapsed_sec)}`;
+  let line1 = "";
+  if (mode === "continuous") {
+    const target = Number(snap.target_success || 0);
+    const targetText = target > 0 ? String(target) : "不限";
+    line1 = `run=${snap.run_id || "-"} | 持续运行 | 已启动 ${startedTasks} | 成功 ${snap.succeeded || 0}/${targetText} | 失败 ${snap.failed || 0}${stopPart} | 活动 ${snap.active || 0}`;
+  } else {
+    line1 = `run=${snap.run_id || "-"} | 完成 ${done}/${total} | 成功 ${snap.succeeded || 0} | 失败 ${snap.failed || 0}${stopPart} | 活动 ${snap.active || 0}`;
+  }
+  const phase = snap.phase ? ` | 阶段 ${snap.phase}` : "";
+  const line2 = `速度 ${formatSpeed(snap.avg_success_per_min)} | 成功率 ${formatRate(snap.success_rate)} | 耗时 ${formatElapsed(snap.elapsed_sec)}${phase}`;
   $("progressStats").textContent = `${line1}\n${line2}`;
   const fc = snap.failure_counts || {};
   $("failureBox").textContent = Object.keys(fc).length

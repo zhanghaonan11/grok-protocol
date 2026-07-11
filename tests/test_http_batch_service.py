@@ -514,10 +514,14 @@ class SnapshotMetricsTests(unittest.TestCase):
     def test_stopped_not_counted_as_failed_or_completed(self):
         runner = self._make_runner(count=4)
         runner.started = True
+        runner.phase = "running"
         runner.started_at_monotonic = 1000.0
-        runner.workers[0].status = "succeeded"
-        runner.workers[1].status = "failed"
-        runner.workers[2].status = "stopped"
+        runner.workers = [svc.WorkerState(i) for i in range(1,5)]
+        runner.worker_by_index = {w.index: w for w in runner.workers}
+        runner.started_tasks = 4
+        runner._mark_terminal(runner.workers[0], "succeeded")
+        runner._mark_terminal(runner.workers[1], "failed")
+        runner._mark_terminal(runner.workers[2], "stopped")
         runner.workers[3].status = "queued"
         with mock.patch.object(svc.time, "monotonic", return_value=1060.0):
             snap = runner.snapshot()
@@ -535,13 +539,60 @@ class SnapshotMetricsTests(unittest.TestCase):
             "email_domain_rejected",
         )
 
+
+    def test_continuous_mode_no_prealloc_and_target_success(self):
+        runner = self._make_runner(count=1)
+        runner.plan.target_mode = svc.TARGET_MODE_CONTINUOUS
+        runner.plan.target_success = 2
+        runner.plan.count = 0
+        runner.plan.workers = 2
+        # empty workers at init
+        self.assertEqual(runner.workers, [])
+        runner.started = True
+        runner.phase = "running"
+        runner.started_at_monotonic = 1000.0
+        # simulate two successes via counters/refill logic
+        runner.succeeded_count = 2
+        self.assertFalse(runner._should_refill())
+        runner.tick()
+        snap = runner.snapshot()
+        self.assertEqual(snap["target_mode"], "continuous")
+        self.assertEqual(snap["target_success"], 2)
+        self.assertEqual(snap["succeeded"], 2)
+        self.assertIn(snap["phase"], {"draining", "done", "running"})
+
+    def test_fixed_mode_spawn_on_demand_limit(self):
+        runner = self._make_runner(count=3)
+        runner.plan.workers = 2
+        # no prealloc
+        self.assertEqual(len(runner.workers), 0)
+        with mock.patch.object(runner, "_spawn_one", side_effect=lambda w, acquire_proxy=True: setattr(w, "status", "running")):
+            runner.started = True
+            runner.phase = "running"
+            runner._spawn_available()
+            self.assertEqual(runner.started_tasks, 2)
+            self.assertEqual(len(runner.workers), 2)
+            # finish one and refill to third
+            runner.workers[0].status = "succeeded"
+            runner.succeeded_count = 1
+            # active only second
+            runner.workers[0].status = "succeeded"
+            # mark first terminal properly
+            runner.workers[1].status = "running"
+            runner._spawn_available()
+            self.assertEqual(runner.started_tasks, 3)
+
     def test_snapshot_metrics_running(self):
         runner = self._make_runner(count=3)
         runner.started = True
+        runner.phase = "running"
         runner.started_at_wall = "2026-07-11T12:00:00"
         runner.started_at_monotonic = 1000.0
-        runner.workers[0].status = "succeeded"
-        runner.workers[1].status = "failed"
+        runner.workers = [svc.WorkerState(1), svc.WorkerState(2), svc.WorkerState(3)]
+        runner.worker_by_index = {w.index: w for w in runner.workers}
+        runner.started_tasks = 3
+        runner._mark_terminal(runner.workers[0], "succeeded")
+        runner._mark_terminal(runner.workers[1], "failed")
         runner.workers[2].status = "running"
         with mock.patch.object(svc.time, "monotonic", return_value=1120.0):
             snap = runner.snapshot()
@@ -555,10 +606,14 @@ class SnapshotMetricsTests(unittest.TestCase):
     def test_snapshot_metrics_freeze_after_finalize_time(self):
         runner = self._make_runner(count=1)
         runner.started = True
+        runner.phase = "done"
         runner.started_at_wall = "2026-07-11T12:00:00"
         runner.started_at_monotonic = 1000.0
         runner.finished_at_monotonic = 1060.0
-        runner.workers[0].status = "succeeded"
+        runner.workers = [svc.WorkerState(1)]
+        runner.worker_by_index = {1: runner.workers[0]}
+        runner.started_tasks = 1
+        runner._mark_terminal(runner.workers[0], "succeeded")
         with mock.patch.object(svc.time, "monotonic", return_value=9999.0):
             snap1 = runner.snapshot()
             snap2 = runner.snapshot()

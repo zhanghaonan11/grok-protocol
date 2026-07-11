@@ -34,6 +34,9 @@ DEFAULT_OUTPUT_DIR = ROOT_DIR / "xai_credentials"
 DEFAULT_EXPORT_DIR = ROOT_DIR / "exports"
 RUNS_DIR = ROOT_DIR / "http_runs"
 MAX_COUNT = 99999999
+TARGET_MODE_COUNT = "count"
+TARGET_MODE_CONTINUOUS = "continuous"
+RECENT_WORKER_WINDOW = 200
 MAX_WORKERS = 32
 MAX_LOCAL_TURNSTILE_WORKERS = 3  # default local Turnstile concurrency cap
 MIN_LOCAL_TURNSTILE_WORKERS = 1
@@ -233,6 +236,9 @@ class Settings:
     turnstile_broker_url: str = ""
     sso_convert_retries: int = DEFAULT_SSO_CONVERT_RETRIES
     sso_convert_cooldown: int = DEFAULT_SSO_CONVERT_COOLDOWN
+    target_mode: str = TARGET_MODE_COUNT
+    target_success: int = 0
+    continuous_max_runtime_min: int = 0
     config: Dict[str, object] = field(default_factory=dict)
 
 
@@ -258,6 +264,9 @@ class RunPlan:
     warnings: List[str] = field(default_factory=list)
     embedded_proxy_enabled: bool = False
     embedded_proxy_max_node_retries: int = 3
+    target_mode: str = TARGET_MODE_COUNT
+    target_success: int = 0
+    continuous_max_runtime_min: int = 0
 
 
 @dataclass
@@ -578,6 +587,23 @@ def _load_runtime_fields(settings: Settings) -> None:
     config = settings.config
     settings.count = _positive_int(config.get("register_count", 1), "注册数量", MAX_COUNT)
     settings.workers = _positive_int(config.get("concurrent_workers", 1), "并发数", MAX_WORKERS)
+    settings.target_mode = _normalize_target_mode(
+        config.get("run_target_mode") or config.get("target_mode") or TARGET_MODE_COUNT
+    )
+    settings.target_success = _bounded_int(
+        config.get("target_success"),
+        "成功目标",
+        minimum=0,
+        maximum=MAX_COUNT,
+        default=0,
+    )
+    settings.continuous_max_runtime_min = _bounded_int(
+        config.get("continuous_max_runtime_min"),
+        "持续运行最长分钟",
+        minimum=0,
+        maximum=10080,
+        default=0,
+    )
 
     output_raw = str(
         config.get("xai_oauth_output_dir")
@@ -632,6 +658,9 @@ def persist_settings(settings: Settings) -> None:
     config = dict(settings.config or {})
     config["register_count"] = int(settings.count)
     config["concurrent_workers"] = int(settings.workers)
+    config["run_target_mode"] = _normalize_target_mode(settings.target_mode)
+    config["target_success"] = int(settings.target_success)
+    config["continuous_max_runtime_min"] = int(settings.continuous_max_runtime_min)
     config["tui_run_mode"] = _normalize_run_mode(settings.run_mode)
     config["tui_proxy_mode"] = "none" if settings.no_proxy else str(settings.proxy_mode or "auto")
     config["xai_oauth_output_dir"] = _config_path_value(
@@ -716,10 +745,43 @@ def _resolve_proxy_args(settings: Settings) -> Tuple[str, List[str]]:
     return mode, args
 
 
+def _normalize_target_mode(value: object) -> str:
+    raw = str(value or TARGET_MODE_COUNT).strip().lower()
+    if raw in {TARGET_MODE_COUNT, "fixed", "total"}:
+        return TARGET_MODE_COUNT
+    if raw in {TARGET_MODE_CONTINUOUS, "infinite", "unlimited", "forever", "stream"}:
+        return TARGET_MODE_CONTINUOUS
+    return TARGET_MODE_COUNT
+
+
 def build_plan(settings: Settings) -> RunPlan:
     config = settings.config
+    target_mode = _normalize_target_mode(getattr(settings, "target_mode", None) or config.get("run_target_mode"))
+    target_success = _bounded_int(
+        getattr(settings, "target_success", None)
+        if getattr(settings, "target_success", None) is not None
+        else config.get("target_success"),
+        "成功目标",
+        minimum=0,
+        maximum=MAX_COUNT,
+        default=0,
+    )
+    continuous_max_runtime_min = _bounded_int(
+        getattr(settings, "continuous_max_runtime_min", None)
+        if getattr(settings, "continuous_max_runtime_min", None) is not None
+        else config.get("continuous_max_runtime_min"),
+        "持续运行最长分钟",
+        minimum=0,
+        maximum=10080,
+        default=0,
+    )
     count = _positive_int(settings.count, "注册数量", MAX_COUNT)
-    workers = min(_positive_int(settings.workers, "并发数", MAX_WORKERS), count)
+    workers = _positive_int(settings.workers, "并发数", MAX_WORKERS)
+    if target_mode == TARGET_MODE_COUNT:
+        workers = min(workers, count)
+    else:
+        # continuous: count is ignored as preallocation size
+        count = 0
     provider = _normalize_turnstile_provider(
         settings.turnstile_provider or config.get("turnstile_provider") or "capsolver"
     )
@@ -849,6 +911,15 @@ def build_plan(settings: Settings) -> RunPlan:
         maximum=20,
         default=3,
     )
+    if target_mode == TARGET_MODE_CONTINUOUS:
+        if target_success > 0:
+            warnings.append(
+                f"持续运行：成功达到 {target_success} 后自动停止补货；也可手动停止。"
+            )
+        else:
+            warnings.append("持续运行：按并发水位线补货，直到手动停止。")
+        if continuous_max_runtime_min > 0:
+            warnings.append(f"持续运行最长 {continuous_max_runtime_min} 分钟。")
     return RunPlan(
         config_path=settings.config_path,
         run_mode=run_mode,
@@ -870,6 +941,9 @@ def build_plan(settings: Settings) -> RunPlan:
         warnings=warnings,
         embedded_proxy_enabled=embedded_proxy_enabled,
         embedded_proxy_max_node_retries=embedded_proxy_max_node_retries,
+        target_mode=target_mode,
+        target_success=target_success,
+        continuous_max_runtime_min=continuous_max_runtime_min,
     )
 
 
@@ -880,7 +954,7 @@ def describe_plan(plan: RunPlan, *, dry_run: bool = False) -> str:
         f"配置文件: {plan.config_path}",
         f"邮箱: {plan.email_provider}",
         f"Turnstile: {_turnstile_provider_label(plan.provider, headless=plan.turnstile_headless)}",
-        f"注册数量: {plan.count}",
+        (f"目标模式: 持续运行 | 成功目标: {plan.target_success if plan.target_success else '不限'}" if getattr(plan, "target_mode", TARGET_MODE_COUNT) == TARGET_MODE_CONTINUOUS else f"注册数量: {plan.count}"),
         f"并发数: {plan.workers}",
         f"Turnstile并发: {plan.turnstile_workers} / 队列: {plan.turnstile_queue_size}",
         f"提交并发: {plan.submit_workers}",
@@ -971,13 +1045,20 @@ class BatchRunner:
         self.plan = plan
         self.run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
         self.run_dir = RUNS_DIR / self.run_id
-        self.workers = [WorkerState(index=index) for index in range(1, plan.count + 1)]
+        # On-demand workers: do not preallocate plan.count objects.
+        self.workers: List[WorkerState] = []
+        self.worker_by_index: Dict[int, WorkerState] = {}
         self.events: queue.Queue[Tuple[int, str]] = queue.Queue()
         self.logs: Deque[str] = deque(maxlen=MAX_LOG_LINES)
         self.started = False
         self.done = False
         self.stopping = False
-        self.next_index = 0
+        self.phase: str = "idle"  # idle|running|draining|done
+        self.next_index = 1
+        self.started_tasks = 0
+        self.succeeded_count = 0
+        self.failed_count = 0
+        self.stopped_count = 0
         self.summary_path: Optional[Path] = None
         self.account_count = 0
         self.failure_counts: Dict[str, int] = {key: 0 for key in FAILURE_CATEGORIES}
@@ -988,6 +1069,7 @@ class BatchRunner:
         self.broker_process: Optional[subprocess.Popen[str]] = None
         self.owns_broker = False
         self.embedded_proxy_manager = None
+        self.recent_workers: Deque[WorkerState] = deque(maxlen=RECENT_WORKER_WINDOW)
 
     @staticmethod
     def _free_loopback_port() -> int:
@@ -1119,21 +1201,69 @@ class BatchRunner:
 
     @property
     def completed(self) -> int:
-        # Only count workers that actually finished work.
-        # Stopped/cancelled queued slots must not inflate progress or failures.
-        return sum(worker.status in {"succeeded", "failed"} for worker in self.workers)
+        return int(self.succeeded_count + self.failed_count)
 
     @property
     def succeeded(self) -> int:
-        return sum(worker.status == "succeeded" for worker in self.workers)
+        return int(self.succeeded_count)
 
     @property
     def failed(self) -> int:
-        return sum(worker.status == "failed" for worker in self.workers)
+        return int(self.failed_count)
 
     @property
     def stopped(self) -> int:
-        return sum(worker.status == "stopped" for worker in self.workers)
+        return int(self.stopped_count)
+
+    @property
+    def is_continuous(self) -> bool:
+        return str(getattr(self.plan, "target_mode", TARGET_MODE_COUNT)) == TARGET_MODE_CONTINUOUS
+
+    def _mark_terminal(self, worker: WorkerState, status: str) -> None:
+        """Apply terminal status once and keep counters consistent."""
+        if worker.status in {"succeeded", "failed", "stopped"}:
+            # already terminal
+            if worker.status != status:
+                worker.status = status
+            return
+        worker.status = status
+        if status == "succeeded":
+            self.succeeded_count += 1
+        elif status == "failed":
+            self.failed_count += 1
+        elif status == "stopped":
+            self.stopped_count += 1
+        # Keep a compact recent window for UI; full history stays on disk logs.
+        self.recent_workers.append(worker)
+
+    def _should_refill(self) -> bool:
+        if self.done or self.stopping or self.phase == "draining":
+            return False
+        if self.is_continuous:
+            target = int(getattr(self.plan, "target_success", 0) or 0)
+            if target > 0 and self.succeeded_count >= target:
+                return False
+            max_min = int(getattr(self.plan, "continuous_max_runtime_min", 0) or 0)
+            if max_min > 0 and self.started_at_monotonic is not None:
+                if (time.monotonic() - self.started_at_monotonic) >= max_min * 60:
+                    return False
+            return True
+        # fixed count mode
+        return self.started_tasks < int(self.plan.count or 0)
+
+    def _prune_finished_workers(self) -> None:
+        """Drop terminal workers from hot lists; keep recent window + active only."""
+        keep_idx = {w.index for w in self.recent_workers}
+        for w in self.active:
+            keep_idx.add(w.index)
+        # Always retain non-terminal.
+        new_workers = []
+        for w in self.workers:
+            if w.status in {"running", "converting", "queued"} or w.index in keep_idx:
+                new_workers.append(w)
+            else:
+                self.worker_by_index.pop(w.index, None)
+        self.workers = new_workers
 
     def _log(self, source: str, message: str) -> None:
         message = _safe_text(message)
@@ -1157,9 +1287,16 @@ class BatchRunner:
             self._log("SYSTEM", f"浏览器健康: {format_browser_health()}")
         self._start_shared_broker()
         self.started = True
+        self.phase = "running"
         self.started_at_monotonic = time.monotonic()
         self.started_at_wall = time.strftime("%Y-%m-%dT%H:%M:%S")
-        self._log("SYSTEM", "HTTP 协议批量任务已启动（邮箱/OTP/注册走协议；仅 local Turnstile 会临时开浏览器）")
+        if self.is_continuous:
+            self._log(
+                "SYSTEM",
+                "持续运行已启动（水位线补货，不预创建超大任务表；邮箱/OTP/注册走协议；仅 local Turnstile 会临时开浏览器）",
+            )
+        else:
+            self._log("SYSTEM", "HTTP 协议批量任务已启动（邮箱/OTP/注册走协议；仅 local Turnstile 会临时开浏览器）")
         for warning in self.plan.warnings:
             self._log("SYSTEM", warning)
         self._spawn_available()
@@ -1448,7 +1585,7 @@ class BatchRunner:
         worker.process = None
         worker.return_code = None
         if not self._acquire_embedded_proxy(worker):
-            worker.status = "failed"
+            self._mark_terminal(worker, "failed")
             worker.last_log = worker.last_log or "没有可用的内嵌代理节点"
             self._record_failure(worker, worker.last_log)
             return True  # handled (terminal)
@@ -1467,7 +1604,7 @@ class BatchRunner:
         worker.log_path = self.run_dir / f"worker_{worker.index:03d}.log"
         if acquire_proxy and self.plan.embedded_proxy_enabled:
             if not self._acquire_embedded_proxy(worker):
-                worker.status = "failed"
+                self._mark_terminal(worker, "failed")
                 if not worker.last_log:
                     worker.last_log = "没有可用的内嵌代理节点"
                 self._record_failure(worker, worker.last_log)
@@ -1487,9 +1624,10 @@ class BatchRunner:
                 bufsize=1,
             )
         except OSError as exc:
-            worker.status = "failed"
+            self._mark_terminal(worker, "failed")
             worker.last_log = f"无法启动进程: {exc}"
             self._release_embedded_proxy(worker, failed=True)
+            self._record_failure(worker, worker.last_log)
             self._log(f"W{worker.index:02d}", worker.last_log)
             try:
                 log_handle.close()
@@ -1521,11 +1659,26 @@ class BatchRunner:
         threading.Thread(target=copy_and_queue, daemon=True).start()
 
     def _spawn_available(self) -> None:
-        if self.stopping:
+        if self.done:
             return
-        while len(self.active) < self.plan.workers and self.next_index < len(self.workers):
-            worker = self.workers[self.next_index]
+        if not self._should_refill():
+            if self.phase == "running" and (self.stopping or not self._should_refill()):
+                # Enter draining when no more work should be created.
+                if self.stopping or self.is_continuous or self.started_tasks >= int(self.plan.count or 0):
+                    if self.phase != "draining":
+                        self.phase = "draining"
+                        if self.is_continuous and not self.stopping:
+                            if int(getattr(self.plan, "target_success", 0) or 0) > 0 and self.succeeded_count >= int(self.plan.target_success):
+                                self._log("SYSTEM", f"已达成功目标 {self.plan.target_success}，停止补货并收尾")
+                            elif int(getattr(self.plan, "continuous_max_runtime_min", 0) or 0) > 0:
+                                self._log("SYSTEM", "已达最长运行时间，停止补货并收尾")
+            return
+        while len(self.active) < self.plan.workers and self._should_refill():
+            worker = WorkerState(index=self.next_index)
             self.next_index += 1
+            self.started_tasks += 1
+            self.workers.append(worker)
+            self.worker_by_index[worker.index] = worker
             self._spawn_one(worker)
 
     def _drain_events(self) -> None:
@@ -1534,7 +1687,7 @@ class BatchRunner:
                 worker_index, message = self.events.get_nowait()
             except queue.Empty:
                 return
-            worker = self.workers[worker_index - 1]
+            worker = self.worker_by_index.get(worker_index) or self.workers[worker_index - 1]
             raw = str(message or "")
             if raw.startswith("__CONVERT_DONE__|"):
                 parts = raw.split("|", 2)
@@ -1542,9 +1695,9 @@ class BatchRunner:
                 msg = parts[2] if len(parts) >= 3 else "SSO 转换结束"
                 worker.convert_thread = None
                 if self.stopping and not ok:
-                    worker.status = "stopped"
+                    self._mark_terminal(worker, "stopped")
                 else:
-                    worker.status = "succeeded" if ok else "failed"
+                    self._mark_terminal(worker, "succeeded" if ok else "failed")
                 worker.last_log = msg
                 if worker.status == "failed":
                     self._record_failure(worker, msg)
@@ -1563,7 +1716,7 @@ class BatchRunner:
             worker.return_code = return_code
             worker.process = None
             if self.stopping:
-                worker.status = "stopped"
+                self._mark_terminal(worker, "stopped")
                 worker.last_log = "已被操作者停止"
                 self._release_embedded_proxy(worker, failed=False)
                 self._log(f"W{worker.index:02d}", worker.last_log)
@@ -1572,7 +1725,7 @@ class BatchRunner:
                 if self.plan.run_mode == RUN_MODE_REGISTER_SSO:
                     self._start_sso_convert(worker)
                 else:
-                    worker.status = "succeeded"
+                    self._mark_terminal(worker, "succeeded")
                     worker.last_log = "协议任务已完成"
                     self._log(f"W{worker.index:02d}", worker.last_log)
             else:
@@ -1582,9 +1735,13 @@ class BatchRunner:
                     # either respawned (running) or terminal without node
                     if worker.status == "running":
                         continue
+                    # retry helper may set failed without counters
+                    if worker.status == "failed" and worker.index not in self._failure_recorded:
+                        self.failed_count += 1
+                        self.recent_workers.append(worker)
                     self._log(f"W{worker.index:02d}", worker.last_log)
                     continue
-                worker.status = "failed"
+                self._mark_terminal(worker, "failed")
                 self._release_embedded_proxy(worker, failed=False)
                 self._record_failure(worker, worker.last_log)
                 self._log(f"W{worker.index:02d}", worker.last_log)
@@ -1595,13 +1752,12 @@ class BatchRunner:
         try:
             summary = ROOT_DIR / f"accounts_http_{self.run_id}.txt"
             lines: List[str] = []
-            for worker in self.workers:
-                if not worker.accounts_path or not worker.accounts_path.is_file():
-                    continue
+            account_files = sorted(self.run_dir.glob("accounts_*.txt"))
+            for accounts_path in account_files:
                 try:
                     lines.extend(
                         line
-                        for line in worker.accounts_path.read_text(encoding="utf-8").splitlines()
+                        for line in accounts_path.read_text(encoding="utf-8").splitlines()
                         if line.strip()
                     )
                 except OSError as exc:
@@ -1624,6 +1780,7 @@ class BatchRunner:
         finally:
             self._release_all_embedded_proxies()
             self._stop_shared_broker()
+            self.phase = "done"
             self.done = True
 
     def tick(self) -> None:
@@ -1631,8 +1788,12 @@ class BatchRunner:
             return
         self._drain_events()
         self._check_processes()
+        self._prune_finished_workers()
+        # If success target / runtime reached, flip to draining.
+        if self.phase == "running" and not self._should_refill():
+            self.phase = "draining"
         self._spawn_available()
-        if self.completed == len(self.workers) and not self.active:
+        if self.phase in {"draining", "running"} and (not self.active) and (not self._should_refill()):
             self._drain_events()
             self._finalize()
 
@@ -1640,14 +1801,15 @@ class BatchRunner:
         if self.done:
             return
         self.stopping = True
-        self._log("SYSTEM", "正在停止活动中的协议任务")
-        for worker in self.workers:
+        self.phase = "draining"
+        self._log("SYSTEM", "正在停止活动中的协议任务（停止补货并收尾）")
+        for worker in list(self.workers):
             if worker.status == "queued":
-                worker.status = "stopped"
+                self._mark_terminal(worker, "stopped")
                 worker.last_log = "因批次被停止而未启动"
                 self._release_embedded_proxy(worker, failed=False)
                 self._log(f"W{worker.index:02d}", worker.last_log)
-        for worker in self.workers:
+        for worker in list(self.workers):
             if worker.status == "running" and worker.process is not None:
                 try:
                     worker.process.terminate()
@@ -1656,8 +1818,7 @@ class BatchRunner:
             elif worker.status == "converting":
                 worker.last_log = "停止中：等待当前 SSO 转换收尾"
                 self._log(f"W{worker.index:02d}", worker.last_log)
-        self._release_all_embedded_proxies()
-        self._stop_shared_broker()
+        # Keep proxy/broker alive until finalize so in-flight converts can finish cleanly.
 
     def _record_failure(self, worker: WorkerState, reason_text: str = "") -> None:
         if worker.index in self._failure_recorded:
@@ -1687,17 +1848,31 @@ class BatchRunner:
         )
         success_rate = None if completed == 0 else float(succeeded) / float(completed)
 
+        # UI only needs active + recent terminals; full history is on disk.
+        active_workers = self.active
+        recent = list(self.recent_workers)
+        shown_map = {}
+        for worker in list(active_workers) + recent:
+            shown_map[worker.index] = worker
+        shown_workers = sorted(shown_map.values(), key=lambda w: int(w.index))
+        planned_count = int(self.plan.count or 0)
+        if self.is_continuous:
+            planned_count = int(getattr(self.plan, "target_success", 0) or 0)
         return {
             "run_id": self.run_id,
             "started": self.started,
             "done": self.done,
             "stopping": self.stopping,
-            "count": len(self.workers),
+            "phase": self.phase,
+            "target_mode": getattr(self.plan, "target_mode", TARGET_MODE_COUNT),
+            "target_success": int(getattr(self.plan, "target_success", 0) or 0),
+            "count": planned_count,
+            "started_tasks": int(self.started_tasks),
             "completed": completed,
             "succeeded": succeeded,
             "failed": self.failed,
             "stopped": self.stopped,
-            "active": len(self.active),
+            "active": len(active_workers),
             "account_count": self.account_count,
             "failure_counts": dict(self.failure_counts),
             "warnings": list(self.plan.warnings),
@@ -1707,6 +1882,8 @@ class BatchRunner:
             "elapsed_sec": elapsed_sec,
             "avg_success_per_min": avg_success_per_min,
             "success_rate": success_rate,
+            "worker_total": len(shown_workers),
+            "workers_truncated": max(0, int(self.started_tasks) - len(shown_workers)),
             "workers": [
                 {
                     "index": worker.index,
@@ -1714,7 +1891,7 @@ class BatchRunner:
                     "last_log": worker.last_log,
                     "return_code": worker.return_code,
                 }
-                for worker in self.workers
+                for worker in shown_workers
             ],
         }
 
@@ -1830,6 +2007,9 @@ def _settings_to_public_dict(settings: Settings) -> Dict[str, object]:
         "config_path": str(settings.config_path),
         "count": settings.count,
         "workers": settings.workers,
+        "target_mode": _normalize_target_mode(getattr(settings, "target_mode", TARGET_MODE_COUNT)),
+        "target_success": int(getattr(settings, "target_success", 0) or 0),
+        "continuous_max_runtime_min": int(getattr(settings, "continuous_max_runtime_min", 0) or 0),
         "output_dir": str(settings.output_dir),
         "run_mode": settings.run_mode,
         "proxy_mode": "none" if settings.no_proxy or str(settings.proxy_mode or "").strip().lower() == "none" else str(settings.proxy_mode or "auto"),
@@ -2543,6 +2723,12 @@ class BatchService:
         data = dict(data or {})
         if "count" in data:
             self.settings.count = _positive_int(data.get("count"), "注册数量", MAX_COUNT)
+        if "target_mode" in data or "run_target_mode" in data:
+            self.settings.target_mode = _normalize_target_mode(data.get("target_mode", data.get("run_target_mode")))
+        if "target_success" in data:
+            self.settings.target_success = _bounded_int(data.get("target_success"), "成功目标", minimum=0, maximum=MAX_COUNT, default=0)
+        if "continuous_max_runtime_min" in data:
+            self.settings.continuous_max_runtime_min = _bounded_int(data.get("continuous_max_runtime_min"), "持续运行最长分钟", minimum=0, maximum=10080, default=0)
         if "workers" in data:
             self.settings.workers = _positive_int(data.get("workers"), "并发数", MAX_WORKERS)
         if "output_dir" in data and str(data.get("output_dir") or "").strip():
