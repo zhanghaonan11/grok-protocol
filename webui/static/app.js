@@ -5,10 +5,10 @@ const logBox = $("logBox");
 let es = null;
 
 // ---- UI performance: buffer logs / throttle snapshot ----
-const LOG_MAX_LINES = 400;
-const SNAPSHOT_MIN_INTERVAL_MS = 500;
-const LOG_FLUSH_MS = 100;
-const WORKER_RENDER_LIMIT = 24;
+const LOG_MAX_LINES = 200;
+const SNAPSHOT_MIN_INTERVAL_MS = 1000;
+const LOG_FLUSH_MS = 500;
+const WORKER_RENDER_LIMIT = 12;
 
 let logLines = [];
 let logPending = [];
@@ -89,12 +89,18 @@ function flushLogs() {
   if (stick) logBox.scrollTop = logBox.scrollHeight;
 }
 
+function liveLogsEnabled() {
+  const el = $("liveLogs");
+  return !!(el && el.checked);
+}
+
 function appendLog(line) {
   if (!line) return;
+  // Hard gate: when live logs are off, never touch the log DOM.
+  if (!liveLogsEnabled()) return;
   logPending.push(String(line));
-  // Cap pending to avoid memory blowup if tab is backgrounded.
-  if (logPending.length > 1000) {
-    logPending = logPending.slice(-500);
+  if (logPending.length > 300) {
+    logPending = logPending.slice(-150);
   }
   if (!logFlushTimer) {
     logFlushTimer = setTimeout(flushLogs, LOG_FLUSH_MS);
@@ -149,7 +155,7 @@ function renderSnapshotNow(snap) {
   const ranked = workers.slice().sort((a, b) => {
     const rank = (w) => {
       const s = String(w.status || "");
-      if (s === "running" || s === "active") return 0;
+      if (s === "running" || s === "active" || s === "converting") return 0;
       if (s === "failed") return 1;
       if (s === "queued") return 2;
       if (s === "succeeded") return 3;
@@ -158,9 +164,12 @@ function renderSnapshotNow(snap) {
     return rank(a) - rank(b) || (a.index || 0) - (b.index || 0);
   });
   const shown = ranked.slice(0, WORKER_RENDER_LIMIT);
-  const extra = workers.length - shown.length;
+  const backendExtra = Number(snap.workers_truncated || 0);
+  const extra = backendExtra > 0
+    ? backendExtra + Math.max(0, workers.length - shown.length)
+    : Math.max(0, (Number(snap.worker_total || workers.length) - shown.length));
   const body = shown.map((w) => {
-    const log = String(w.last_log || "").replace(/\s+/g, " ").slice(0, 120);
+    const log = String(w.last_log || "").replace(/\s+/g, " ").slice(0, 100);
     return `W${String(w.index).padStart(2,"0")} ${w.status || "-"} | ${log}`;
   });
   if (extra > 0) body.push(`... 另有 ${extra} 个 worker 未展开`);
@@ -221,15 +230,24 @@ function disconnectEvents() {
   }
 }
 
+function eventsUrl() {
+  const params = new URLSearchParams();
+  params.set("logs", liveLogsEnabled() ? "1" : "0");
+  params.set("worker_limit", String(WORKER_RENDER_LIMIT));
+  return "/api/runs/current/events?" + params.toString();
+}
+
 function connectEvents() {
   disconnectEvents();
   esShouldRun = true;
-  es = new EventSource("/api/runs/current/events");
+  // logs=0 by default: backend skips log fanout entirely during batches.
+  es = new EventSource(eventsUrl());
   es.addEventListener("snapshot", (e) => {
     try { renderSnapshot(JSON.parse(e.data)); }
     catch {}
   });
   es.addEventListener("log", (e) => {
+    if (!liveLogsEnabled()) return;
     try {
       const data = JSON.parse(e.data);
       appendLog(data.line || "");
@@ -304,7 +322,8 @@ $("btnStart").onclick = async () => {
   try {
     const snap = await api("/api/runs", { method: "POST", body: JSON.stringify(formData()) });
     setMsg("批次已启动: " + (snap.run_id || ""));
-    appendLog("[UI] 批次启动 " + (snap.run_id || ""));
+    if (liveLogsEnabled()) appendLog("[UI] 批次启动 " + (snap.run_id || ""));
+    else if (logBox) logBox.textContent = "批次运行中：实时日志关闭（可手动打开）\nrun=" + (snap.run_id || "");
     renderSnapshot(snap);
     connectEvents();
   } catch (e) {
@@ -335,7 +354,21 @@ $("btnCleanup").onclick = async () => {
   } catch (e) { setMsg(String(e.message || e), true); }
 };
 
-$("btnClearLog").onclick = () => { clearLogs(); };
+$("btnClearLog").onclick = () => { clearLogs(); if (!liveLogsEnabled() && logBox) logBox.textContent = "实时日志已关闭（只显示进度）"; };
+if ($("liveLogs")) {
+  $("liveLogs").onchange = () => {
+    if (liveLogsEnabled()) {
+      if (logBox && /实时日志已关闭/.test(logBox.textContent || "")) logBox.textContent = "";
+      appendLog("[UI] 已开启实时日志");
+    } else {
+      clearLogs();
+      if (logBox) logBox.textContent = "实时日志已关闭（只显示进度）";
+      setMsg("已关闭实时日志，进度继续刷新");
+    }
+    // Reconnect SSE so backend can attach/detach log listeners immediately.
+    if (esShouldRun) connectEvents();
+  };
+}
 $("btnRefreshHistory").onclick = () => refreshHistory().catch(e => setMsg(String(e.message || e), true));
 
 
@@ -415,17 +448,26 @@ async function refreshEmbeddedProxyStatus() {
 }
 
 let embeddedPollTimer = null;
+function batchIsRunning() {
+  const badge = $("busyBadge");
+  const t = badge ? String(badge.textContent || "") : "";
+  return t === "运行中" || t === "停止中";
+}
 function startEmbeddedProxyPolling() {
   if (embeddedPollTimer) return;
   const tick = async () => {
     try {
+      // During a live batch, freeze proxy DOM thrash; only keep a slow heartbeat.
+      if (batchIsRunning()) {
+        embeddedPollTimer = setTimeout(tick, 30000);
+        return;
+      }
       const data = await refreshEmbeddedProxyStatus();
       const phase = String((data && data.phase) || "");
-      // Slower polling on run console to keep UI responsive during batches.
-      const delay = phase === "starting" ? 2000 : 8000;
+      const delay = phase === "starting" ? 2500 : 15000;
       embeddedPollTimer = setTimeout(tick, delay);
     } catch {
-      embeddedPollTimer = setTimeout(tick, 8000);
+      embeddedPollTimer = setTimeout(tick, batchIsRunning() ? 30000 : 15000);
     }
   };
   tick();

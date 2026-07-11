@@ -99,6 +99,8 @@ class WebUIAppTests(unittest.TestCase):
             self.assertEqual(page.status_code, 200)
             self.assertIn("配置中心", page.text)
             self.assertIn("运行台", page.text)
+            self.assertIn("凭证列表", page.text)
+            self.assertIn('href="/credentials"', page.text)
             self.assertIn('name="local_turnstile_max_workers"', page.text)
             self.assertIn('name="submit_workers"', page.text)
             self.assertIn('name="yyds_create_spacing_sec"', page.text)
@@ -256,6 +258,311 @@ class WebUIAppTests(unittest.TestCase):
             self.assertIn("embeddedProxySummaryRun", page.text)
             self.assertIn("embeddedBadge", page.text)
 
+
+
+
+    def test_credentials_list_api_and_page_panel(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            out = root / "xai_credentials"
+            out.mkdir()
+            (out / "xai-a@example.com.json").write_text(
+                '{"access_token":"tok-a","email":"a@example.com"}\n',
+                encoding="utf-8",
+            )
+            (out / "xai-a@example.com.sso").write_text("sso-a-value\n", encoding="utf-8")
+            (out / "xai-b@example.com.json").write_text(
+                '{"access_token":"tok-b"}',
+                encoding="utf-8",
+            )
+            # lone sso without json should be ignored
+            (out / "orphan.sso").write_text("orphan", encoding="utf-8")
+
+            service = self._service(root)
+            service.settings.output_dir = out
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+
+            cfg_page = client.get("/config")
+            self.assertEqual(cfg_page.status_code, 200)
+            self.assertIn("凭证列表", cfg_page.text)  # nav link
+            self.assertNotIn("credListText", cfg_page.text)
+
+            page = client.get("/credentials")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("凭证列表", page.text)
+            self.assertIn("credListText", page.text)
+            self.assertIn("btnCredNext", page.text)
+            self.assertIn("exportTableBody", page.text)
+            self.assertIn("btnExportRefresh", page.text)
+            self.assertIn("exportPreviewText", page.text)
+            self.assertIn("历史文件预览", page.text)
+
+            data = client.get("/api/credentials", params={"page": 1, "page_size": 1000})
+            self.assertEqual(data.status_code, 200)
+            body = data.json()
+            self.assertEqual(body["total"], 2)
+            self.assertEqual(body["page"], 1)
+            self.assertEqual(body["page_size"], 1000)
+            self.assertEqual(body["total_pages"], 1)
+            self.assertEqual(len(body["items"]), 2)
+            # newest mtime first roughly; both present
+            lines = body["text"].splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertTrue(all("____" in ln for ln in lines))
+            joined = "\n".join(lines)
+            self.assertIn('{"access_token":"tok-a","email":"a@example.com"}____sso-a-value', joined)
+            self.assertIn('{"access_token":"tok-b"}____', joined)
+            self.assertNotIn("orphan", joined)
+
+            # pagination boundary
+            page2 = client.get("/api/credentials", params={"page": 1, "page_size": 1}).json()
+            self.assertEqual(page2["total"], 2)
+            self.assertEqual(page2["page_size"], 1)
+            self.assertEqual(page2["total_pages"], 2)
+            self.assertEqual(len(page2["items"]), 1)
+
+
+
+    def test_credentials_export_page_deletes_local_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            out = root / "xai_credentials"
+            out.mkdir()
+            json_a = out / "xai-a@example.com.json"
+            sso_a = out / "xai-a@example.com.sso"
+            json_b = out / "xai-b@example.com.json"
+            sso_b = out / "xai-b@example.com.sso"
+            json_a.write_text('{"access_token":"tok-a"}', encoding="utf-8")
+            sso_a.write_text("sso-a", encoding="utf-8")
+            json_b.write_text('{"access_token":"tok-b"}', encoding="utf-8")
+            sso_b.write_text("sso-b", encoding="utf-8")
+
+            service = self._service(root)
+            service.settings.output_dir = out
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+
+            page = client.get("/credentials")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("btnCredExportPage", page.text)
+
+            # export only first page with page_size=1
+            resp = client.post(
+                "/api/credentials/export-page",
+                json={"page": 1, "page_size": 1},
+            )
+            self.assertEqual(resp.status_code, 200)
+            body = resp.json()
+            self.assertTrue(body.get("ok"))
+            self.assertEqual(body.get("exported_count"), 1)
+            self.assertGreaterEqual(int(body.get("deleted_count") or 0), 1)
+            filename = str(body.get("filename") or "")
+            self.assertTrue(filename.startswith("grok+"))
+            self.assertTrue(filename.endswith(".txt"))
+            export_path = Path(body["path"])
+            self.assertTrue(export_path.is_file())
+            self.assertEqual(export_path.parent.name, "exports")
+            self.assertIn("/exports/", str(export_path).replace("\\", "/"))
+            content = export_path.read_text(encoding="utf-8")
+            self.assertIn("____", content)
+            self.assertTrue(content.endswith("\n") or "____" in content)
+
+            # exactly one pair remains
+            remaining_json = list(out.glob("*.json"))
+            self.assertEqual(len(remaining_json), 1)
+
+            # empty page export fails without deleting remaining
+            # first export remaining
+            resp2 = client.post(
+                "/api/credentials/export-page",
+                json={"page": 1, "page_size": 1000},
+            )
+            self.assertEqual(resp2.status_code, 200)
+            self.assertEqual(len(list(out.glob("*.json"))), 0)
+            bad = client.post(
+                "/api/credentials/export-page",
+                json={"page": 1, "page_size": 1000},
+            )
+            self.assertEqual(bad.status_code, 400)
+
+
+
+    def test_credential_exports_list_download_delete(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            out = root / "xai_credentials"
+            out.mkdir()
+            (out / "xai-a@example.com.json").write_text('{"access_token":"tok-a"}', encoding="utf-8")
+            (out / "xai-a@example.com.sso").write_text("sso-a", encoding="utf-8")
+
+            # legacy root-level export should be migrated into exports/
+            legacy = root / "grok+legacy.txt"
+            legacy.write_text("legacy-line\n", encoding="utf-8")
+
+            service = self._service(root)
+            service.settings.output_dir = out
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+
+            # list migrates legacy
+            listed = client.get("/api/credential-exports")
+            self.assertEqual(listed.status_code, 200)
+            body = listed.json()
+            self.assertTrue(str(body.get("export_dir") or "").endswith("exports"))
+            names = [i["name"] for i in body.get("items") or []]
+            self.assertIn("grok+legacy.txt", names)
+            self.assertFalse(legacy.exists())
+            self.assertTrue((root / "exports" / "grok+legacy.txt").is_file())
+
+            # export creates new file in exports/
+            exported = client.post("/api/credentials/export-page", json={"page": 1, "page_size": 1000})
+            self.assertEqual(exported.status_code, 200)
+            exp = exported.json()
+            self.assertEqual(Path(exp["path"]).parent.name, "exports")
+            fname = exp["filename"]
+
+            # download
+            dl = client.get("/api/credential-exports/download", params={"name": fname})
+            self.assertEqual(dl.status_code, 200)
+            self.assertIn("____", dl.text)
+
+            # path traversal blocked
+            bad = client.get("/api/credential-exports/download", params={"name": "../config.json"})
+            self.assertIn(bad.status_code, {400, 404})
+
+            # delete
+            deleted = client.request("DELETE", "/api/credential-exports", params={"name": fname})
+            self.assertEqual(deleted.status_code, 200)
+            self.assertFalse((root / "exports" / fname).exists())
+
+
+
+    def test_credential_export_preview(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            exports = root / "exports"
+            exports.mkdir()
+            name = "grok+history.txt"
+            content = "{\"a\":1}____sso-a\n{\"b\":2}____sso-b\n"
+            (exports / name).write_text(content, encoding="utf-8")
+            service = self._service(root)
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+
+            page = client.get("/credentials")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("exportPreviewText", page.text)
+            self.assertIn("历史文件预览", page.text)
+            self.assertIn("btnExportPreviewCopy", page.text)
+
+            prev = client.get("/api/credential-exports/preview", params={"name": name})
+            self.assertEqual(prev.status_code, 200)
+            body = prev.json()
+            self.assertTrue(body.get("ok"))
+            self.assertEqual(body.get("name"), name)
+            self.assertIn("____", body.get("text") or "")
+            self.assertEqual(body.get("line_count"), 2)
+            self.assertFalse(body.get("truncated"))
+
+
+
+
+    def test_run_console_defaults_and_slim_snapshot_api(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            service = self._service(root)
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+            page = client.get("/")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn('id="liveLogs"', page.text)
+            self.assertIn("默认关闭实时日志", page.text)
+            # live logs checkbox should not be pre-checked
+            self.assertNotIn('id="liveLogs" checked', page.text)
+
+            fake_snap = {
+                "run_id": "demo",
+                "started": True,
+                "done": False,
+                "stopping": False,
+                "count": 64,
+                "completed": 3,
+                "succeeded": 2,
+                "failed": 1,
+                "active": 8,
+                "elapsed_sec": 12,
+                "avg_success_per_min": 10.0,
+                "success_rate": 0.66,
+                "failure_counts": {"turnstile_timeout": 1},
+                "workers": [
+                    {"index": i, "status": "running" if i <= 8 else "queued", "last_log": ("x" * 300), "return_code": None}
+                    for i in range(1, 65)
+                ],
+            }
+            with mock.patch.object(service, "current_snapshot", return_value=fake_snap):
+                cur = client.get("/api/runs/current")
+            self.assertEqual(cur.status_code, 200)
+            run = cur.json()["run"]
+            self.assertEqual(run["run_id"], "demo")
+            self.assertEqual(run["worker_total"], 64)
+            self.assertLessEqual(len(run["workers"]), 16)
+            self.assertGreater(run["workers_truncated"], 0)
+            self.assertLessEqual(len(run["workers"][0]["last_log"]), 120)
+
+    def test_run_events_default_skips_log_listener(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            service = self._service(root)
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+            attached = {"n": 0}
+            real_attach = service.attach_log_listener
+
+            def track_attach(cb):
+                attached["n"] += 1
+                return real_attach(cb)
+
+            with mock.patch.object(service, "attach_log_listener", side_effect=track_attach):
+                with mock.patch.object(service, "current_snapshot", return_value={
+                    "run_id": "demo",
+                    "started": True,
+                    "done": True,
+                    "count": 1,
+                    "completed": 1,
+                    "succeeded": 1,
+                    "failed": 0,
+                    "active": 0,
+                    "workers": [{"index": 1, "status": "succeeded", "last_log": "ok"}],
+                    "failure_counts": {},
+                }):
+                    with client.stream("GET", "/api/runs/current/events") as resp:
+                        self.assertEqual(resp.status_code, 200)
+                        # Read a little so generator starts.
+                        for i, chunk in enumerate(resp.iter_text()):
+                            if i > 2:
+                                break
+            self.assertEqual(attached["n"], 0)
+
+            with mock.patch.object(service, "attach_log_listener", side_effect=track_attach):
+                with mock.patch.object(service, "current_snapshot", return_value={
+                    "run_id": "demo",
+                    "started": True,
+                    "done": True,
+                    "count": 1,
+                    "completed": 1,
+                    "succeeded": 1,
+                    "failed": 0,
+                    "active": 0,
+                    "workers": [{"index": 1, "status": "succeeded", "last_log": "ok"}],
+                    "failure_counts": {},
+                }):
+                    with client.stream("GET", "/api/runs/current/events?logs=1") as resp:
+                        self.assertEqual(resp.status_code, 200)
+                        for i, chunk in enumerate(resp.iter_text()):
+                            if i > 2:
+                                break
+            self.assertGreaterEqual(attached["n"], 1)
 
 
 if __name__ == "__main__":

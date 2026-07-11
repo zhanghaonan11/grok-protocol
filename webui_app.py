@@ -47,6 +47,107 @@ def get_service() -> BatchService:
     return _APP_SERVICE
 
 
+def _compact_embedded_proxy_status(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Keep run-console / health payloads small."""
+    if not isinstance(data, dict):
+        return {
+            "enabled": False,
+            "running": False,
+            "phase": "error",
+            "message": "invalid status",
+            "healthy": 0,
+            "total": 0,
+            "leases": 0,
+            "nodes": [],
+        }
+    nodes = data.get("nodes") if isinstance(data.get("nodes"), list) else []
+    slim_nodes = []
+    for n in nodes[:8]:
+        if not isinstance(n, dict):
+            continue
+        slim_nodes.append(
+            {
+                "id": n.get("id"),
+                "name": n.get("name"),
+                "healthy": n.get("healthy"),
+                "success_count": n.get("success_count"),
+                "fail_count": n.get("fail_count"),
+                "ref_count": n.get("ref_count"),
+                "local_http": n.get("local_http"),
+            }
+        )
+    return {
+        "enabled": data.get("enabled"),
+        "running": data.get("running"),
+        "phase": data.get("phase"),
+        "message": data.get("message"),
+        "healthy": data.get("healthy"),
+        "total": data.get("total"),
+        "leases": data.get("leases"),
+        "last_error": data.get("last_error"),
+        "nodes": slim_nodes,
+    }
+
+
+def _slim_run_snapshot(snap: Optional[Dict[str, Any]], *, worker_limit: int = 16) -> Dict[str, Any]:
+    """UI-facing snapshot: counters + a small ranked worker sample."""
+    if not isinstance(snap, dict):
+        return {"done": True, "workers": [], "failure_counts": {}}
+
+    workers = snap.get("workers") if isinstance(snap.get("workers"), list) else []
+    ranked = []
+    for w in workers:
+        if not isinstance(w, dict):
+            continue
+        status = str(w.get("status") or "")
+        if status in {"running", "active", "converting"}:
+            rank = 0
+        elif status == "failed":
+            rank = 1
+        elif status == "queued":
+            rank = 2
+        elif status == "succeeded":
+            rank = 3
+        else:
+            rank = 4
+        ranked.append((rank, int(w.get("index") or 0), w))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+
+    slim_workers = []
+    limit = max(0, int(worker_limit or 0))
+    for _, _, w in ranked[:limit]:
+        last_log = str(w.get("last_log") or "")
+        if len(last_log) > 120:
+            last_log = last_log[:120]
+        slim_workers.append(
+            {
+                "index": w.get("index"),
+                "status": w.get("status"),
+                "last_log": last_log,
+                "return_code": w.get("return_code"),
+            }
+        )
+
+    return {
+        "run_id": snap.get("run_id"),
+        "started": snap.get("started"),
+        "done": snap.get("done"),
+        "stopping": snap.get("stopping"),
+        "count": snap.get("count"),
+        "completed": snap.get("completed"),
+        "succeeded": snap.get("succeeded"),
+        "failed": snap.get("failed"),
+        "active": snap.get("active"),
+        "elapsed_sec": snap.get("elapsed_sec"),
+        "avg_success_per_min": snap.get("avg_success_per_min"),
+        "success_rate": snap.get("success_rate"),
+        "failure_counts": snap.get("failure_counts") or {},
+        "worker_total": len(workers),
+        "workers_truncated": max(0, len(workers) - len(slim_workers)),
+        "workers": slim_workers,
+    }
+
+
 def _ensure_poller(service: BatchService) -> None:
     global _POLL_THREAD
     if _POLL_THREAD is not None and _POLL_THREAD.is_alive():
@@ -58,7 +159,7 @@ def _ensure_poller(service: BatchService) -> None:
                 service.poll()
             except Exception:
                 pass
-            time.sleep(0.15)
+            time.sleep(0.4)
 
     _POLL_STOP.clear()
     _POLL_THREAD = threading.Thread(target=_loop, name="batch-poller", daemon=True)
@@ -119,9 +220,9 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
         svc = get_service()
         snap = svc.current_snapshot()
         try:
-            emb = svc.get_embedded_proxy_status()
+            emb = _compact_embedded_proxy_status(svc.get_embedded_proxy_status())
         except Exception as exc:
-            emb = {"enabled": False, "phase": "error", "message": str(exc)}
+            emb = {"enabled": False, "phase": "error", "message": str(exc), "nodes": []}
         return {
             "ok": True,
             "host": DEFAULT_WEBUI_HOST,
@@ -325,36 +426,9 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
             data = get_service().get_embedded_proxy_status()
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
-        if not compact or not isinstance(data, dict):
-            return data
-        # Run console only needs lightweight fields.
-        nodes = data.get("nodes") if isinstance(data.get("nodes"), list) else []
-        slim_nodes = []
-        for n in nodes[:8]:
-            if not isinstance(n, dict):
-                continue
-            slim_nodes.append(
-                {
-                    "id": n.get("id"),
-                    "name": n.get("name"),
-                    "healthy": n.get("healthy"),
-                    "success_count": n.get("success_count"),
-                    "fail_count": n.get("fail_count"),
-                    "ref_count": n.get("ref_count"),
-                    "local_http": n.get("local_http"),
-                }
-            )
-        return {
-            "enabled": data.get("enabled"),
-            "running": data.get("running"),
-            "phase": data.get("phase"),
-            "message": data.get("message"),
-            "healthy": data.get("healthy"),
-            "total": data.get("total"),
-            "leases": data.get("leases"),
-            "last_error": data.get("last_error"),
-            "nodes": slim_nodes,
-        }
+        if compact:
+            return _compact_embedded_proxy_status(data if isinstance(data, dict) else None)
+        return data
 
     @app.post("/api/embedded-proxy/start")
     def embedded_proxy_start(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -427,12 +501,12 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
         _ensure_poller(svc)
-        return JSONResponse(status_code=202, content=snap)
+        return JSONResponse(status_code=202, content=_slim_run_snapshot(snap))
 
     @app.post("/api/runs/current/stop")
     def runs_stop() -> Dict[str, Any]:
         try:
-            return get_service().stop_run()
+            return _slim_run_snapshot(get_service().stop_run())
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
 
@@ -441,56 +515,56 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
         snap = get_service().current_snapshot()
         if snap is None:
             return {"run": None}
-        return {"run": snap}
+        return {"run": _slim_run_snapshot(snap)}
 
     @app.get("/api/runs/current/events")
-    async def runs_events() -> StreamingResponse:
+    async def runs_events(
+        logs: bool = Query(False),
+        worker_limit: int = Query(12, ge=0, le=64),
+    ) -> StreamingResponse:
+        """SSE for run console.
+
+        By default only snapshots are pushed. Pass logs=1 only when the UI
+        checkbox is enabled, otherwise browser/server still spend CPU on logs.
+        """
         svc = get_service()
         _ensure_poller(svc)
-        # Smaller queue: drop oldest logs under pressure instead of freezing UI/server.
-        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=200)
+        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=32 if logs else 8)
         loop = asyncio.get_running_loop()
         closed = {"v": False}
+        want_logs = bool(logs)
+        snap_interval = 2.0
+        worker_cap = max(0, min(64, int(worker_limit or 0)))
 
         def _ui_snapshot(snap: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-            if not isinstance(snap, dict):
-                return {"done": True, "workers": [], "failure_counts": {}}
-            workers = snap.get("workers") if isinstance(snap.get("workers"), list) else []
-            slim_workers = []
-            for w in workers:
-                if not isinstance(w, dict):
-                    continue
-                last_log = str(w.get("last_log") or "")
-                if len(last_log) > 160:
-                    last_log = last_log[:160]
-                slim_workers.append(
-                    {
-                        "index": w.get("index"),
-                        "status": w.get("status"),
-                        "last_log": last_log,
-                        "return_code": w.get("return_code"),
-                    }
-                )
-            return {
-                "run_id": snap.get("run_id"),
-                "started": snap.get("started"),
-                "done": snap.get("done"),
-                "stopping": snap.get("stopping"),
-                "count": snap.get("count"),
-                "completed": snap.get("completed"),
-                "succeeded": snap.get("succeeded"),
-                "failed": snap.get("failed"),
-                "active": snap.get("active"),
-                "elapsed_sec": snap.get("elapsed_sec"),
-                "avg_success_per_min": snap.get("avg_success_per_min"),
-                "success_rate": snap.get("success_rate"),
-                "failure_counts": snap.get("failure_counts") or {},
-                "workers": slim_workers,
-            }
+            return _slim_run_snapshot(snap, worker_limit=worker_cap)
+
+        log_budget = {"window_start": time.monotonic(), "sent": 0, "dropped": 0}
+        log_rate_per_sec = 6
 
         def on_log(line: str) -> None:
-            if closed["v"]:
+            if closed["v"] or not want_logs:
                 return
+            now = time.monotonic()
+            if now - float(log_budget["window_start"]) >= 1.0:
+                dropped = int(log_budget["dropped"] or 0)
+                log_budget["window_start"] = now
+                log_budget["sent"] = 0
+                log_budget["dropped"] = 0
+                if dropped > 0:
+                    notice = json.dumps(
+                        {"line": f"[UI] 日志过快，已省略 {dropped} 行"},
+                        ensure_ascii=False,
+                    )
+                    notice_msg = "event: log\ndata: " + notice + "\n\n"
+                    try:
+                        loop.call_soon_threadsafe(queue.put_nowait, notice_msg)
+                    except Exception:
+                        pass
+            if int(log_budget["sent"] or 0) >= log_rate_per_sec:
+                log_budget["dropped"] = int(log_budget["dropped"] or 0) + 1
+                return
+            log_budget["sent"] = int(log_budget["sent"] or 0) + 1
             payload = json.dumps({"line": line}, ensure_ascii=False)
             msg = "event: log\ndata: " + payload + "\n\n"
 
@@ -514,7 +588,8 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
             except Exception:
                 pass
 
-        svc.attach_log_listener(on_log)
+        if want_logs:
+            svc.attach_log_listener(on_log)
 
         async def gen():
             try:
@@ -523,9 +598,9 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
                 last_snap = time.monotonic()
                 while True:
                     try:
-                        msg = await asyncio.wait_for(queue.get(), timeout=0.35)
+                        msg = await asyncio.wait_for(queue.get(), timeout=0.8)
                         yield msg
-                        for _ in range(40):
+                        for _ in range(20):
                             try:
                                 yield queue.get_nowait()
                             except asyncio.QueueEmpty:
@@ -533,7 +608,7 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
                     except asyncio.TimeoutError:
                         pass
                     now = time.monotonic()
-                    if now - last_snap >= 1.0:
+                    if now - last_snap >= snap_interval:
                         snap = _ui_snapshot(svc.current_snapshot())
                         yield "event: snapshot\ndata: " + json.dumps(snap, ensure_ascii=False) + "\n\n"
                         if snap.get("done"):
@@ -542,12 +617,14 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
                         last_snap = now
             finally:
                 closed["v"] = True
-                try:
-                    svc.detach_log_listener(on_log)
-                except Exception:
-                    pass
+                if want_logs:
+                    try:
+                        svc.detach_log_listener(on_log)
+                    except Exception:
+                        pass
 
         return StreamingResponse(gen(), media_type="text/event-stream")
+
 
     @app.get("/api/runs")
     def runs_list(limit: int = Query(50, ge=1, le=200)) -> Dict[str, Any]:
