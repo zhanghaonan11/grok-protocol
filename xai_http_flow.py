@@ -1632,10 +1632,18 @@ def solve_turnstile_result(
         )
     except (TypeError, ValueError):
         reported_token_length = 0
-    if token_length < 80 and not (lease_id and reported_token_length >= 80):
+    # Local broker may return token_length via lease/extras, or only a lease_id
+    # with the real token available on /consume. Empty body token is OK then.
+    lease_ok = bool(lease_id) and (
+        reported_token_length >= 80 or reported_token_length == 0
+    )
+    if lease_id and 0 < reported_token_length < 80:
+        lease_ok = False
+    if token_length < 80 and not lease_ok:
         raise VerificationRequiredError(
             f"{normalized_provider} 返回的 Turnstile token 无效 "
-            f"(len={token_length}, reported_len={reported_token_length})"
+            f"(len={token_length}, reported_len={reported_token_length}, "
+            f"lease={'yes' if lease_id else 'no'})"
         )
     return result
 
@@ -3570,21 +3578,40 @@ def run_registration(
                 token_len = len(str(getattr(solve_result, "token", "") or "").strip())
                 extras = getattr(solve_result, "extras", None)
                 lease_id = ""
+                reported_token_length = 0
                 if isinstance(extras, dict):
                     lease_id = str(extras.get("lease_id") or "").strip()
+                    try:
+                        reported_token_length = int(
+                            extras.get("token_length")
+                            or extras.get("token_len")
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        reported_token_length = 0
+                # Local broker keeps the real token behind a lease; empty body token
+                # with a valid lease is a success and must be consumed later.
+                lease_ok = bool(lease_id) and (
+                    token_len >= 80 or reported_token_length >= 80 or reported_token_length == 0
+                )
+                # If broker reports an explicit short token length, treat as failure.
+                if lease_id and reported_token_length > 0 and reported_token_length < 80 and token_len < 80:
+                    lease_ok = False
                 _log(
                     client.log_callback,
                     (
                         f"[HTTP] Turnstile 求解返回 | elapsed_ms={elapsed_ms} "
-                        f"token_len={token_len} lease={'yes' if lease_id else 'no'} "
+                        f"token_len={token_len} reported_len={reported_token_length} "
+                        f"lease={'yes' if lease_id else 'no'} "
                         f"attempt={attempt}/{max_attempts}"
                     ),
                 )
-                if token_len > 0:
+                if token_len >= 80 or lease_ok:
                     last_exc = None
                     break
                 last_exc = VerificationRequiredError(
-                    f"Turnstile 返回空 token (len={token_len})"
+                    f"Turnstile 返回空 token (len={token_len}, reported_len={reported_token_length}, "
+                    f"lease={'yes' if lease_id else 'no'})"
                 )
                 _log(
                     client.log_callback,
