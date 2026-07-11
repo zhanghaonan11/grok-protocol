@@ -271,6 +271,109 @@ class ConfigCenterTests(unittest.TestCase):
             disk = json.loads(cfg.read_text(encoding="utf-8"))
             self.assertEqual(disk["local_turnstile_max_workers"], 9)
 
+    def test_config_center_reads_and_writes_submit_workers(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                        "submit_workers": 6,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            data = service.get_config_center()
+            self.assertEqual(data["fields"]["submit_workers"], 6)
+
+            updated = service.update_config_center({"fields": {"submit_workers": 8}})
+            self.assertEqual(updated["fields"]["submit_workers"], 8)
+            self.assertEqual(service.settings.submit_workers, 8)
+            disk = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(disk["submit_workers"], 8)
+
+    def test_config_center_reads_and_writes_yyds_create_spacing_sec(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                        "yyds_create_spacing_sec": 0.2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            data = service.get_config_center()
+            self.assertEqual(data["fields"]["yyds_create_spacing_sec"], 0.2)
+
+            updated = service.update_config_center(
+                {"fields": {"yyds_create_spacing_sec": 0.05}}
+            )
+            self.assertEqual(updated["fields"]["yyds_create_spacing_sec"], 0.05)
+            disk = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(disk["yyds_create_spacing_sec"], 0.05)
+
+    def test_config_center_rejects_invalid_yyds_create_spacing_sec(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            with self.assertRaises(svc.TuiConfigError):
+                service.update_config_center({"fields": {"yyds_create_spacing_sec": -1}})
+            with self.assertRaises(svc.TuiConfigError):
+                service.update_config_center({"fields": {"yyds_create_spacing_sec": 999}})
+            with self.assertRaises(svc.TuiConfigError):
+                service.update_config_center({"fields": {"yyds_create_spacing_sec": "abc"}})
+
+    def test_config_center_rejects_invalid_submit_workers(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            with self.assertRaises(svc.TuiConfigError):
+                service.update_config_center({"fields": {"submit_workers": 0}})
+            with self.assertRaises(svc.TuiConfigError):
+                service.update_config_center({"fields": {"submit_workers": 99}})
+            with self.assertRaises(svc.TuiConfigError):
+                service.update_config_center({"fields": {"submit_workers": "abc"}})
+
     def test_config_center_rejects_invalid_local_turnstile_max_workers(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -295,6 +398,38 @@ class ConfigCenterTests(unittest.TestCase):
             with self.assertRaises(svc.TuiConfigError):
                 service.update_config_center({"fields": {"local_turnstile_max_workers": "abc"}})
 
+
+
+    def test_proxy_mode_none_does_not_auto_enable_proxy_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            proxy_file = root / "proxies.txt"
+            proxy_file.write_text("1.2.3.4:8080:user:pass\n", encoding="utf-8")
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                        "tui_proxy_mode": "none",
+                        "proxy_file": "proxies.txt",
+                        "proxies": ["1.2.3.4:8080:user:pass"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            self.assertEqual(service.settings.proxy_mode, "none")
+            self.assertTrue(service.settings.no_proxy)
+            plan = svc.build_plan(service.settings)
+            self.assertEqual(plan.proxy_mode, "none")
+            self.assertEqual(plan.proxy_args, [])
+            public = service.public_settings()
+            self.assertEqual(public["proxy_mode"], "none")
+            self.assertTrue(public["no_proxy"])
 
 class ProxyPoolTestTests(unittest.TestCase):
     def test_proxy_pool_sample_reports(self):

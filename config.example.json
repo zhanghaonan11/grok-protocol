@@ -22,6 +22,7 @@
   "yyds_api_key": "",
   "yyds_jwt": "",
   "yyds_api_base": "https://maliapi.215.im/v1",
+  "yyds_create_spacing_sec": 1.5,
   "ms_mail_file": "",
   "xai_oauth_auto": true,
   "xai_oauth_output_dir": "xai_credentials",
@@ -40,5 +41,6 @@
   "tui_sso_convert_retries": 5,
   "tui_sso_convert_cooldown": 3,
   "turnstile_headless": false,
-  "local_turnstile_max_workers": 3
+  "local_turnstile_max_workers": 3,
+  "submit_workers": 4
 }

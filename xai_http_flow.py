@@ -94,6 +94,51 @@ def build_runtime_fingerprint_profile(
         return build_canonical_fingerprint_profile(browser_major=major)
     return DEFAULT_FINGERPRINT
 
+
+
+def _session_with_impersonate_fallback(impersonate: str, *, log_callback: LogFn = None) -> Any:
+    """Create curl_cffi Session, falling back when impersonate target is unsupported."""
+    from turnstile_broker import _impersonate_for_browser_major, _impersonate_is_usable
+
+    candidates = []
+    primary = str(impersonate or "").strip()
+    if primary:
+        candidates.append(primary)
+    for name in (
+        _impersonate_for_browser_major("136"),
+        "chrome136",
+        "chrome131",
+        "chrome124",
+        "chrome120",
+        "chrome",
+    ):
+        if name and name not in candidates:
+            candidates.append(name)
+
+    last_error: Optional[Exception] = None
+    for name in candidates:
+        if name != primary and not _impersonate_is_usable(name):
+            continue
+        try:
+            session = requests.Session(impersonate=name)
+            # Force-materialize impersonate support on versions that fail lazily.
+            try:
+                session.request("GET", "http://127.0.0.1:9/", timeout=0.05)
+            except Exception as exc:
+                msg = str(exc or "").lower()
+                if "impersonat" in msg and "not supported" in msg:
+                    raise
+            if name != primary:
+                _log(log_callback, f"[HTTP][warn] impersonate 回退: {primary or '-'} -> {name}")
+            return session
+        except Exception as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise last_error
+    return requests.Session(impersonate="chrome")
+
+
 DEFAULT_ACCEPT_LANGUAGE = DEFAULT_FINGERPRINT.accept_language
 CHROME136_SEC_CH_UA = DEFAULT_FINGERPRINT.sec_ch_ua
 DEFAULT_USER_AGENT = DEFAULT_FINGERPRINT.user_agent
@@ -1768,7 +1813,10 @@ class BrowserlessXAIClient:
         self.user_agent = fingerprint.user_agent
         self.accept_language = fingerprint.accept_language
         self.log_callback = log_callback
-        self.session = session or requests.Session(impersonate=fingerprint.impersonate)
+        self.session = session or _session_with_impersonate_fallback(
+            fingerprint.impersonate,
+            log_callback=log_callback,
+        )
         headers = getattr(self.session, "headers", None)
         if headers is not None:
             headers.update(
@@ -2605,13 +2653,51 @@ _YYDS_CREATE_STATE_PATH = Path(
 )
 
 
-def _yyds_create_spacing_sec() -> float:
-    """Minimum spacing between YYDS account-create calls across processes."""
-    raw = str(os.environ.get("XAI_YYDS_CREATE_SPACING_SEC") or "1.5").strip()
+DEFAULT_YYDS_CREATE_SPACING_SEC = 1.5
+MIN_YYDS_CREATE_SPACING_SEC = 0.0
+MAX_YYDS_CREATE_SPACING_SEC = 60.0
+
+
+def resolve_yyds_create_spacing_sec(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    strict: bool = False,
+) -> float:
+    """Return YYDS account-create spacing seconds.
+
+    Priority:
+      1) env XAI_YYDS_CREATE_SPACING_SEC
+      2) config.yyds_create_spacing_sec
+      3) DEFAULT_YYDS_CREATE_SPACING_SEC (1.5)
+
+    This only paces /accounts create calls. Other YYDS endpoints are unaffected.
+    """
+    env_raw = str(os.environ.get("XAI_YYDS_CREATE_SPACING_SEC") or "").strip()
+    cfg_raw = None
+    if isinstance(config, dict) and "yyds_create_spacing_sec" in config:
+        cfg_raw = config.get("yyds_create_spacing_sec")
+    raw = env_raw if env_raw != "" else ("" if cfg_raw is None else str(cfg_raw).strip())
+    if raw == "":
+        return DEFAULT_YYDS_CREATE_SPACING_SEC
     try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return 1.5
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        if strict:
+            raise ValueError("YYDS 建邮间隔必须是数字（秒）") from exc
+        return DEFAULT_YYDS_CREATE_SPACING_SEC
+    if not (MIN_YYDS_CREATE_SPACING_SEC <= value <= MAX_YYDS_CREATE_SPACING_SEC):
+        if strict:
+            raise ValueError(
+                "YYDS 建邮间隔必须介于 "
+                f"{MIN_YYDS_CREATE_SPACING_SEC} 到 {MAX_YYDS_CREATE_SPACING_SEC} 秒之间"
+            )
+        return DEFAULT_YYDS_CREATE_SPACING_SEC
+    return value
+
+
+def _yyds_create_spacing_sec(config: Optional[Dict[str, Any]] = None) -> float:
+    """Backward-compatible helper used by tests and internal callers."""
+    return resolve_yyds_create_spacing_sec(config, strict=False)
 
 
 @contextmanager
@@ -2685,10 +2771,16 @@ def _yyds_wait_create_slot() -> None:
 
 
 @contextmanager
-def _yyds_create_guard():
+def _yyds_create_guard(*, spacing_sec: Optional[float] = None, config: Optional[Dict[str, Any]] = None):
     """Serialize and pace YYDS /accounts creates across concurrent workers."""
     with _yyds_create_file_lock():
-        spacing = _yyds_create_spacing_sec()
+        if spacing_sec is None:
+            spacing = resolve_yyds_create_spacing_sec(config, strict=False)
+        else:
+            try:
+                spacing = max(0.0, float(spacing_sec))
+            except (TypeError, ValueError):
+                spacing = resolve_yyds_create_spacing_sec(config, strict=False)
         now = time.time()
         last = _yyds_read_last_create_at()
         wait = spacing - (now - float(last or 0.0))
@@ -2783,7 +2875,7 @@ class YydsTempMailbox:
                 "domain": domain,
                 "autoDomainStrategy": "prefer_owned",
             }
-            with _yyds_create_guard():
+            with _yyds_create_guard(config=self.config):
                 response = self._request(
                     "post",
                     f"{self.base}/accounts",
@@ -3384,21 +3476,53 @@ def run_registration(
                 use_headless = raw_headless
             else:
                 use_headless = str(raw_headless or "").strip().lower() in {"1", "true", "yes", "on"}
-        solve_result = solve_turnstile_result(
-            sitekey=sitekey,
-            page_url=client.signup_page_url or SIGNUP_URL,
-            provider=provider,
-            api_key=api_key,
-            proxy=solve_proxy,
-            action=str(turnstile_metadata.get("turnstile_action") or ""),
-            cdata=str(turnstile_metadata.get("turnstile_cdata") or ""),
-            timeout=turnstile_solve_timeout,
-            headless=use_headless,
-            fingerprint=client.fingerprint,
-            broker_url=effective_broker_url,
-            workers=int(turnstile_workers or config.get("turnstile_workers") or 0),
-            queue_size=int(turnstile_queue_size or config.get("turnstile_queue_size") or 64),
+        _log(
+            client.log_callback,
+            (
+                f"[HTTP] 请求 Turnstile 求解 | provider={provider or 'local'} "
+                f"headless={use_headless} broker={'yes' if effective_broker_url else 'no'} "
+                f"sitekey={(sitekey[:12] + '…') if sitekey else '-'} "
+                f"timeout={int(turnstile_solve_timeout or 180)}s"
+            ),
         )
+        solve_started = time.monotonic()
+        try:
+            solve_result = solve_turnstile_result(
+                sitekey=sitekey,
+                page_url=client.signup_page_url or SIGNUP_URL,
+                provider=provider,
+                api_key=api_key,
+                proxy=solve_proxy,
+                action=str(turnstile_metadata.get("turnstile_action") or ""),
+                cdata=str(turnstile_metadata.get("turnstile_cdata") or ""),
+                timeout=turnstile_solve_timeout,
+                headless=use_headless,
+                fingerprint=client.fingerprint,
+                broker_url=effective_broker_url,
+                workers=int(turnstile_workers or config.get("turnstile_workers") or 0),
+                queue_size=int(turnstile_queue_size or config.get("turnstile_queue_size") or 64),
+            )
+        except Exception as exc:
+            elapsed_ms = int((time.monotonic() - solve_started) * 1000)
+            _log(
+                client.log_callback,
+                f"[HTTP][error] Turnstile 求解失败 | elapsed_ms={elapsed_ms} err={_safe_error_text(exc)}",
+            )
+            raise
+        else:
+            elapsed_ms = int((time.monotonic() - solve_started) * 1000)
+            token_len = len(str(getattr(solve_result, 'token', '') or '').strip())
+            extras = getattr(solve_result, 'extras', None)
+            lease_id = ''
+            if isinstance(extras, dict):
+                lease_id = str(extras.get('lease_id') or '').strip()
+            _log(
+                client.log_callback,
+                (
+                    f"[HTTP] Turnstile 求解返回 | elapsed_ms={elapsed_ms} "
+                    f"token_len={token_len} lease={'yes' if lease_id else 'no'}"
+                ),
+            )
     if solve_result is None:
         solve_result = SolveResult(
             token=turnstile_token,

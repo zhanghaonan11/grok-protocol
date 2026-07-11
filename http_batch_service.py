@@ -177,7 +177,9 @@ def cleanup_browser_residues(
             return max(0, before - after)
 
     killed_playwright = int(pkill_fn("ms-playwright/chromium") if kill_playwright else 0)
-    killed_chrome = int(pkill_fn("chrome") if kill_all_chrome else 0)
+    # Always reap this project's headless profiles; do not touch the user's daily Chrome.
+    killed_project_chrome = int(pkill_fn("xai-ts-chrome-") + pkill_fn("xai-chrome-raw-"))
+    killed_chrome = int(pkill_fn("chrome") if kill_all_chrome else 0) + killed_project_chrome
 
     root = Path(temp_root or "/tmp")
     removed = 0
@@ -366,9 +368,16 @@ def _ensure_mode2_ready() -> None:
         raise TuiConfigError(f"模式2 缺少转换脚本: {converter}")
     try:
         import curl_cffi  # noqa: F401
+    except ImportError as exc:  # pragma: no cover - depends on local env
+        raise TuiConfigError(
+            "模式2 需要 curl_cffi（sso_to_auth_json Device Flow）。"
+            f"当前 Python={sys.executable} 未安装 curl_cffi。"
+            f"请执行: {sys.executable} -m pip install -r requirements.txt"
+        ) from exc
     except Exception as exc:  # pragma: no cover - depends on local env
         raise TuiConfigError(
-            "模式2 需要 curl_cffi（sso_to_auth_json Device Flow）。请先安装 requirements.txt"
+            "模式2 依赖 curl_cffi 但当前环境导入异常: "
+            f"Python={sys.executable} err={exc}"
         ) from exc
 
 
@@ -414,6 +423,47 @@ def _config_path_value(path: Path, base: Path) -> str:
         return str(path.resolve().relative_to(base.resolve()))
     except Exception:
         return str(path)
+
+
+
+def resolve_yyds_create_spacing_sec(
+    config: Optional[Dict[str, object]] = None,
+    *,
+    strict: bool = False,
+) -> float:
+    """Return YYDS create spacing seconds from config/env.
+
+    Default 1.5s keeps multi-worker create bursts from tripping older quotas.
+    Set config.yyds_create_spacing_sec or env XAI_YYDS_CREATE_SPACING_SEC.
+    """
+    try:
+        from xai_http_flow import resolve_yyds_create_spacing_sec as _resolve
+    except Exception:
+        # Fallback if import path is broken during partial boots.
+        raw = None if not isinstance(config, dict) else config.get("yyds_create_spacing_sec")
+        env_raw = str(os.environ.get("XAI_YYDS_CREATE_SPACING_SEC") or "").strip()
+        text_value = env_raw if env_raw else ("" if raw is None else str(raw).strip())
+        if text_value == "":
+            return 1.5
+        try:
+            value = float(text_value)
+        except (TypeError, ValueError) as exc:
+            if strict:
+                raise TuiConfigError("YYDS 建邮间隔必须是数字（秒）") from exc
+            return 1.5
+        if not 0.0 <= value <= 60.0:
+            if strict:
+                raise TuiConfigError("YYDS 建邮间隔必须介于 0 到 60 秒之间")
+            return 1.5
+        return value
+    try:
+        return float(_resolve(config if isinstance(config, dict) else None, strict=strict))
+    except ValueError as exc:
+        raise TuiConfigError(str(exc)) from exc
+    except Exception as exc:
+        if strict:
+            raise TuiConfigError(f"YYDS 建邮间隔无效: {exc}") from exc
+        return 1.5
 
 
 def resolve_local_turnstile_max_workers(
@@ -503,12 +553,21 @@ def _load_runtime_fields(settings: Settings) -> None:
     proxy_mode = str(config.get("tui_proxy_mode") or config.get("proxy_mode") or "auto").strip().lower()
     if proxy_mode not in PROXY_MODE_LABELS:
         proxy_mode = "auto"
+    # Keep "none" as a real mode. Older code rewrote it to "auto", which made
+    # build_plan re-enable proxies.txt even after the UI selected "不使用".
+    settings.proxy_mode = proxy_mode
     settings.no_proxy = proxy_mode == "none"
-    settings.proxy_mode = "auto" if proxy_mode == "none" else proxy_mode
     settings.turnstile_provider = _normalize_turnstile_provider(
         config.get("turnstile_provider") or "capsolver"
     )
     settings.turnstile_headless = _as_bool(config.get("turnstile_headless", False))
+    settings.submit_workers = max(
+        1,
+        min(
+            MAX_WORKERS,
+            _positive_int(config.get("submit_workers", DEFAULT_SUBMIT_WORKERS), "提交并发", MAX_WORKERS),
+        ),
+    )
     settings.sso_convert_retries = _bounded_int(
         config.get("tui_sso_convert_retries", config.get("sso_convert_retries")),
         "SSO转换重试次数",
@@ -539,6 +598,7 @@ def persist_settings(settings: Settings) -> None:
     config["tui_sso_convert_cooldown"] = int(settings.sso_convert_cooldown)
     config["turnstile_provider"] = _normalize_turnstile_provider(settings.turnstile_provider)
     config["turnstile_headless"] = bool(settings.turnstile_headless)
+    config["submit_workers"] = int(settings.submit_workers)
     _write_config(settings.config_path, config)
     settings.config = config
 
@@ -582,11 +642,11 @@ def refresh_settings_config(settings: Settings, *, reset_defaults: bool = True) 
 
 
 def _resolve_proxy_args(settings: Settings) -> Tuple[str, List[str]]:
-    if settings.no_proxy or settings.proxy_mode == "none":
+    mode = str(settings.proxy_mode or "").strip().lower()
+    if settings.no_proxy or mode == "none":
         return "none", []
 
     config = settings.config
-    mode = settings.proxy_mode
     direct_proxy = str(config.get("proxy") or "").strip()
     proxy_file_value = str(config.get("proxy_file") or "").strip()
     proxy_file = _absolute_path(proxy_file_value, settings.config_path.parent) if proxy_file_value else None
@@ -678,8 +738,10 @@ def build_plan(settings: Settings) -> RunPlan:
         workers = 1
         warnings.append("绑定会话的 Castle token 会强制单并发执行。")
     if str(email_provider or "").strip().lower() == "yyds" and workers > 1:
+        yyds_spacing = resolve_yyds_create_spacing_sec(config, strict=False)
         warnings.append(
-            "YYDS 建邮有全局限流（跨进程文件锁 + 默认 1.5s 间隔）；"
+            "YYDS 建邮有全局限流（跨进程文件锁 + "
+            f"{yyds_spacing:g}s 间隔，配置 yyds_create_spacing_sec）；"
             "并发越高排队越久，429 会自动退避重试。"
         )
 
@@ -965,6 +1027,9 @@ class BatchRunner:
             except Exception:
                 pass
         self._log("SYSTEM", "共享 Turnstile broker 已关闭")
+        if self.plan.provider == "local":
+            cleanup = cleanup_browser_residues(kill_playwright=True, kill_all_chrome=False)
+            self._log("SYSTEM", f"结束后清理浏览器残留: {format_cleanup_result(cleanup)}")
 
     @property
     def active(self) -> List[WorkerState]:
@@ -999,6 +1064,10 @@ class BatchRunner:
                 os.chmod(directory, 0o700)
             except OSError:
                 pass
+        if self.plan.provider == "local":
+            cleanup = cleanup_browser_residues(kill_playwright=True, kill_all_chrome=False)
+            self._log("SYSTEM", f"启动前清理浏览器残留: {format_cleanup_result(cleanup)}")
+            self._log("SYSTEM", f"浏览器健康: {format_browser_health()}")
         self._start_shared_broker()
         self.started = True
         self.started_at_monotonic = time.monotonic()
@@ -1534,8 +1603,8 @@ def _settings_to_public_dict(settings: Settings) -> Dict[str, object]:
         "workers": settings.workers,
         "output_dir": str(settings.output_dir),
         "run_mode": settings.run_mode,
-        "proxy_mode": settings.proxy_mode,
-        "no_proxy": settings.no_proxy,
+        "proxy_mode": "none" if settings.no_proxy or str(settings.proxy_mode or "").strip().lower() == "none" else str(settings.proxy_mode or "auto"),
+        "no_proxy": bool(settings.no_proxy or str(settings.proxy_mode or "").strip().lower() == "none"),
         "turnstile_provider": settings.turnstile_provider,
         "turnstile_headless": settings.turnstile_headless,
         "sso_convert_retries": settings.sso_convert_retries,
@@ -1784,10 +1853,18 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
             # operators can inspect values already stored in config.json.
             "yyds_api_key": str(raw.get("yyds_api_key") or ""),
             "yyds_jwt": str(raw.get("yyds_jwt") or ""),
+            "yyds_create_spacing_sec": resolve_yyds_create_spacing_sec(raw, strict=False),
             "turnstile_provider": settings.turnstile_provider,
             "turnstile_api_key": str(raw.get("turnstile_api_key") or ""),
             "turnstile_headless": bool(settings.turnstile_headless),
             "local_turnstile_max_workers": resolve_local_turnstile_max_workers(raw, strict=False),
+            "submit_workers": max(
+                1,
+                min(
+                    MAX_WORKERS,
+                    int(raw.get("submit_workers") or settings.submit_workers or DEFAULT_SUBMIT_WORKERS),
+                ),
+            ),
             "duckmail_api_key": str(raw.get("duckmail_api_key") or ""),
             "cloudflare_api_base": str(raw.get("cloudflare_api_base") or ""),
             "cloudflare_api_key": str(raw.get("cloudflare_api_key") or ""),
@@ -1839,6 +1916,17 @@ class BatchService:
             no_proxy=str(config.get("tui_proxy_mode") or "auto").strip().lower() == "none",
             turnstile_provider=_normalize_turnstile_provider(config.get("turnstile_provider") or "capsolver"),
             turnstile_headless=_as_bool(config.get("turnstile_headless")),
+            submit_workers=max(
+                1,
+                min(
+                    MAX_WORKERS,
+                    _positive_int(
+                        config.get("submit_workers", DEFAULT_SUBMIT_WORKERS),
+                        "提交并发",
+                        MAX_WORKERS,
+                    ),
+                ),
+            ),
             sso_convert_retries=_bounded_int(
                 config.get("tui_sso_convert_retries"),
                 "SSO转换重试",
@@ -1984,6 +2072,20 @@ class BatchService:
         if "local_turnstile_max_workers" in fields:
             cfg["local_turnstile_max_workers"] = resolve_local_turnstile_max_workers(
                 {"local_turnstile_max_workers": fields.get("local_turnstile_max_workers")},
+                strict=True,
+            )
+
+        if "submit_workers" in fields:
+            self.settings.submit_workers = _positive_int(
+                fields.get("submit_workers"),
+                "提交并发",
+                MAX_WORKERS,
+            )
+            cfg["submit_workers"] = int(self.settings.submit_workers)
+
+        if "yyds_create_spacing_sec" in fields:
+            cfg["yyds_create_spacing_sec"] = resolve_yyds_create_spacing_sec(
+                {"yyds_create_spacing_sec": fields.get("yyds_create_spacing_sec")},
                 strict=True,
             )
 

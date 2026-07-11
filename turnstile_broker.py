@@ -68,28 +68,63 @@ def _supported_curl_cffi_impersonate_names() -> list[str]:
 
 
 def _impersonate_is_usable(name: str) -> bool:
-    """True only if curl_cffi can actually apply this impersonate target."""
+    """True only if curl_cffi can actually apply this impersonate target.
+
+    Important: some curl_cffi builds accept Curl.impersonate("chrome142") but
+    still raise ImpersonateError when Session(...).get/post runs. Probe both.
+    """
     target = str(name or "").strip()
     if not target:
         return False
     try:
         from curl_cffi import Curl
+        from curl_cffi.requests import Session
         from curl_cffi.requests.impersonate import normalize_browser_type
 
-        # Session(...) may accept unknown strings; Curl.impersonate is authoritative.
         normalized = normalize_browser_type(target)
         curl = Curl()
         try:
             curl.impersonate(normalized)
-            return True
         finally:
             try:
                 curl.close()
             except Exception:
                 pass
-    except Exception:
+
+        # Session construction alone is not enough on some versions; force the
+        # impersonate path to materialize by creating a session and performing a
+        # no-network prepare/open cycle when possible.
+        session = Session(impersonate=target)
+        try:
+            # Prefer a cheap internal check if available.
+            impersonate_attr = getattr(session, "impersonate", None)
+            if impersonate_attr is not None and str(impersonate_attr).strip() == "":
+                return False
+            # Trigger the same code path used by real HTTP calls without network
+            # when curl_cffi exposes request preparation helpers; otherwise do a
+            # localhost connection that fails fast if impersonate is invalid.
+            request = getattr(session, "request", None)
+            if callable(request):
+                try:
+                    request("GET", "http://127.0.0.1:9/", timeout=0.05)
+                except Exception as exc:
+                    msg = str(exc or "").lower()
+                    if "impersonat" in msg and "not supported" in msg:
+                        return False
+                    # Connection errors mean impersonate was accepted.
+            return True
+        finally:
+            close = getattr(session, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+    except Exception as exc:
+        msg = str(exc or "").lower()
+        if "impersonat" in msg:
+            return False
         return False
-    return False
 
 
 def _impersonate_for_browser_major(major: str) -> str:
@@ -137,7 +172,7 @@ def _impersonate_for_browser_major(major: str) -> str:
             if _impersonate_is_usable(name):
                 return name
     # Absolute fallback: never return an unsupported chrome148-like value.
-    for name in ("chrome142", "chrome136", "chrome131", "chrome120", "chrome"):
+    for name in ("chrome136", "chrome131", "chrome124", "chrome120", "chrome142", "chrome"):
         if _impersonate_is_usable(name):
             return name
     return "chrome"

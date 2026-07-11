@@ -100,6 +100,8 @@ class WebUIAppTests(unittest.TestCase):
             self.assertIn("配置中心", page.text)
             self.assertIn("运行台", page.text)
             self.assertIn('name="local_turnstile_max_workers"', page.text)
+            self.assertIn('name="submit_workers"', page.text)
+            self.assertIn('name="yyds_create_spacing_sec"', page.text)
             self.assertIn('class="help-tip"', page.text)
             self.assertIn('data-tip="选临时邮箱服务商，决定用哪套邮箱配置"', page.text)
             self.assertIn('data-tip="仅 local 生效；总并发仍受运行台与 32 上限约束"', page.text)
