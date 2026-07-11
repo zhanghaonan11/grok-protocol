@@ -511,6 +511,30 @@ class SnapshotMetricsTests(unittest.TestCase):
         self.assertIsNone(snap["success_rate"])
         self.assertEqual(snap["started_at"], "")
 
+    def test_stopped_not_counted_as_failed_or_completed(self):
+        runner = self._make_runner(count=4)
+        runner.started = True
+        runner.started_at_monotonic = 1000.0
+        runner.workers[0].status = "succeeded"
+        runner.workers[1].status = "failed"
+        runner.workers[2].status = "stopped"
+        runner.workers[3].status = "queued"
+        with mock.patch.object(svc.time, "monotonic", return_value=1060.0):
+            snap = runner.snapshot()
+        self.assertEqual(snap["completed"], 2)
+        self.assertEqual(snap["succeeded"], 1)
+        self.assertEqual(snap["failed"], 1)
+        self.assertEqual(snap["stopped"], 1)
+        self.assertAlmostEqual(snap["success_rate"], 0.5)
+
+    def test_classify_email_domain_rejected(self):
+        self.assertEqual(
+            svc.classify_failure_text(
+                "CreateEmailValidationCode gRPC 3: This email domain has been rejected"
+            ),
+            "email_domain_rejected",
+        )
+
     def test_snapshot_metrics_running(self):
         runner = self._make_runner(count=3)
         runner.started = True

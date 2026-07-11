@@ -137,6 +137,7 @@ def _slim_run_snapshot(snap: Optional[Dict[str, Any]], *, worker_limit: int = 16
         "completed": snap.get("completed"),
         "succeeded": snap.get("succeeded"),
         "failed": snap.get("failed"),
+        "stopped": snap.get("stopped"),
         "active": snap.get("active"),
         "elapsed_sec": snap.get("elapsed_sec"),
         "avg_success_per_min": snap.get("avg_success_per_min"),

@@ -163,6 +163,15 @@ class ProtocolError(XAIHttpFlowError):
     """Raised when xAI changes a wire/API response shape."""
 
 
+def is_email_domain_rejected_error(exc: BaseException | str) -> bool:
+    text_value = str(exc or "").lower()
+    return (
+        "email domain has been rejected" in text_value
+        or "email-domain-rejected" in text_value
+        or "account:email-domain-rejected" in text_value
+    )
+
+
 class MailboxError(XAIHttpFlowError):
     """Raised by the optional Cloudflare temporary mailbox adapter."""
 
@@ -2856,22 +2865,45 @@ def _yyds_domain_rr_lock():
             pass
 
 
-def _yyds_read_domain_rr_index() -> int:
+def _yyds_read_domain_rr_state() -> Dict[str, Any]:
     path = _YYDS_DOMAIN_RR_STATE_PATH
     try:
         raw = path.read_text(encoding="utf-8").strip()
         if not raw:
-            return 0
+            return {"index": 0, "rejected": []}
         data = json.loads(raw)
-        return int(data.get("index") or 0)
+        if not isinstance(data, dict):
+            return {"index": 0, "rejected": []}
+        rejected = data.get("rejected") if isinstance(data.get("rejected"), list) else []
+        return {
+            "index": int(data.get("index") or 0),
+            "rejected": [str(x).strip().lower() for x in rejected if str(x or "").strip()],
+        }
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return 0
+        return {"index": 0, "rejected": []}
 
 
-def _yyds_write_domain_rr_index(index: int) -> None:
+def _yyds_write_domain_rr_state(*, index: int, rejected: Optional[List[str]] = None) -> None:
     path = _YYDS_DOMAIN_RR_STATE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"index": int(index), "updated_at": time.time()}, ensure_ascii=False)
+    rejected_list = []
+    seen = set()
+    for item in list(rejected or []):
+        domain = str(item or "").strip().lower().lstrip("@")
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        rejected_list.append(domain)
+        if len(rejected_list) >= 500:
+            break
+    payload = json.dumps(
+        {
+            "index": int(index),
+            "rejected": rejected_list,
+            "updated_at": time.time(),
+        },
+        ensure_ascii=False,
+    )
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     try:
         tmp.write_text(payload, encoding="utf-8")
@@ -2888,19 +2920,51 @@ def _yyds_write_domain_rr_index(index: int) -> None:
             pass
 
 
-def _yyds_next_round_robin_domain(domains: List[str]) -> str:
+def _yyds_read_domain_rr_index() -> int:
+    return int(_yyds_read_domain_rr_state().get("index") or 0)
+
+
+def _yyds_write_domain_rr_index(index: int) -> None:
+    state = _yyds_read_domain_rr_state()
+    _yyds_write_domain_rr_state(index=index, rejected=list(state.get("rejected") or []))
+
+
+def _yyds_mark_domain_rejected(domain: str) -> None:
+    domain = str(domain or "").strip().lower().lstrip("@")
+    if not domain:
+        return
+    with _yyds_domain_rr_lock():
+        state = _yyds_read_domain_rr_state()
+        rejected = list(state.get("rejected") or [])
+        if domain not in rejected:
+            rejected.append(domain)
+        _yyds_write_domain_rr_state(index=int(state.get("index") or 0), rejected=rejected)
+
+
+def _yyds_next_round_robin_domain(domains: List[str], *, exclude: Optional[set] = None) -> str:
     """Pick next domain from list with cross-process round-robin state."""
     cleaned = [str(d or "").strip() for d in domains if str(d or "").strip()]
     if not cleaned:
         raise MailboxError("YYDS 域名池为空")
-    if len(cleaned) == 1:
-        return cleaned[0]
+    blocked = {str(x or "").strip().lower() for x in (exclude or set()) if str(x or "").strip()}
     with _yyds_domain_rr_lock():
-        idx = _yyds_read_domain_rr_index()
+        state = _yyds_read_domain_rr_state()
+        rejected = set(state.get("rejected") or [])
+        blocked |= rejected
+        pool = [d for d in cleaned if d.lower() not in blocked] or list(cleaned)
+        if len(pool) == 1:
+            pick = pool[0]
+            # still advance index for stability
+            idx = int(state.get("index") or 0)
+            if idx < 0:
+                idx = 0
+            _yyds_write_domain_rr_state(index=idx + 1, rejected=list(state.get("rejected") or []))
+            return pick
+        idx = int(state.get("index") or 0)
         if idx < 0:
             idx = 0
-        pick = cleaned[idx % len(cleaned)]
-        _yyds_write_domain_rr_index(idx + 1)
+        pick = pool[idx % len(pool)]
+        _yyds_write_domain_rr_state(index=idx + 1, rejected=list(state.get("rejected") or []))
         return pick
 
 
@@ -3027,7 +3091,7 @@ class YydsTempMailbox:
             filtered = [d for d in pool if d.lower() not in blocked]
             if filtered:
                 pool = filtered
-        return _yyds_next_round_robin_domain(pool)
+        return _yyds_next_round_robin_domain(pool, exclude=blocked)
 
     def create(self) -> Tuple[str, str]:
         last_error: Optional[Exception] = None
@@ -3657,8 +3721,48 @@ def run_registration(
         password = password or auto_password
     metadata = client.open_signup()
     if not email_code:
-        requested_at = time.time()
-        client.request_email_validation_code(email, castle_email_token)
+        # Auto-mailbox mode: if xAI rejects the domain, mint another address and retry.
+        max_domain_tries = 5 if mailbox is not None else 1
+        last_domain_error: Optional[Exception] = None
+        for domain_try in range(1, max_domain_tries + 1):
+            requested_at = time.time()
+            try:
+                client.request_email_validation_code(email, castle_email_token)
+                last_domain_error = None
+                break
+            except Exception as exc:
+                last_domain_error = exc
+                if mailbox is None or not is_email_domain_rejected_error(exc):
+                    raise
+                rejected_domain = ""
+                if "@" in str(email):
+                    rejected_domain = str(email).split("@", 1)[1].strip().lower()
+                if rejected_domain:
+                    try:
+                        _yyds_mark_domain_rejected(rejected_domain)
+                    except Exception:
+                        pass
+                _log(
+                    client.log_callback,
+                    (
+                        f"[HTTP][warn] xAI 拒绝邮箱域名，自动换号重试 "
+                        f"{domain_try}/{max_domain_tries} | email={mask_email(email)} "
+                        f"domain={rejected_domain or '-'}"
+                    ),
+                )
+                if domain_try >= max_domain_tries:
+                    break
+                # Mint a new temporary mailbox address and continue.
+                email, mail_token = mailbox.create()
+                provider = "mail-file" if mail_file else str(config.get("email_provider") or "cloudflare")
+                _log(
+                    client.log_callback,
+                    f"[HTTP] 已换号重建邮箱 provider={provider} | email={mask_email(email)}",
+                )
+                # Refresh signup session so cookies/challenge stay coherent.
+                metadata = client.open_signup()
+        if last_domain_error is not None:
+            raise last_domain_error
         if mailbox is None:
             raise XAIHttpFlowError(
                 "验证码已发送；请用 --email-code 重新运行提交注册，或配置 --mail-config/--mail-file 自动轮询"

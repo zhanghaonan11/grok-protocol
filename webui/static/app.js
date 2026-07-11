@@ -142,7 +142,9 @@ function renderSnapshotNow(snap) {
   const done = (snap.completed || 0);
   const pct = total ? Math.round(done * 100 / total) : 0;
   $("progressBar").style.width = pct + "%";
-  const line1 = `run=${snap.run_id || "-"} | 完成 ${done}/${total} | 成功 ${snap.succeeded || 0} | 失败 ${snap.failed || 0} | 活动 ${snap.active || 0}`;
+  const stopped = Number(snap.stopped || 0);
+  const stopPart = stopped > 0 ? ` | 停止 ${stopped}` : "";
+  const line1 = `run=${snap.run_id || "-"} | 完成 ${done}/${total} | 成功 ${snap.succeeded || 0} | 失败 ${snap.failed || 0}${stopPart} | 活动 ${snap.active || 0}`;
   const line2 = `速度 ${formatSpeed(snap.avg_success_per_min)} | 成功率 ${formatRate(snap.success_rate)} | 耗时 ${formatElapsed(snap.elapsed_sec)}`;
   $("progressStats").textContent = `${line1}\n${line2}`;
   const fc = snap.failure_counts || {};

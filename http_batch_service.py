@@ -907,6 +907,7 @@ def describe_plan(plan: RunPlan, *, dry_run: bool = False) -> str:
 
 FAILURE_CATEGORIES = (
     "yyds_rate_limit",
+    "email_domain_rejected",
     "turnstile_hard_block",
     "turnstile_timeout",
     "tls_error",
@@ -924,6 +925,12 @@ def classify_failure_text(text: str) -> str:
     t = raw.lower()
     if ("yyds" in t or "too many account creation" in t) and ("429" in t or "too many" in t):
         return "yyds_rate_limit"
+    if (
+        "email domain has been rejected" in t
+        or "email-domain-rejected" in t
+        or "account:email-domain-rejected" in t
+    ):
+        return "email_domain_rejected"
     if "cloudflare_hard_block" in t or "hard_block" in t or "硬拦截" in raw:
         return "turnstile_hard_block"
     if (
@@ -1112,7 +1119,9 @@ class BatchRunner:
 
     @property
     def completed(self) -> int:
-        return sum(worker.status in {"succeeded", "failed", "stopped"} for worker in self.workers)
+        # Only count workers that actually finished work.
+        # Stopped/cancelled queued slots must not inflate progress or failures.
+        return sum(worker.status in {"succeeded", "failed"} for worker in self.workers)
 
     @property
     def succeeded(self) -> int:
@@ -1120,7 +1129,11 @@ class BatchRunner:
 
     @property
     def failed(self) -> int:
-        return sum(worker.status in {"failed", "stopped"} for worker in self.workers)
+        return sum(worker.status == "failed" for worker in self.workers)
+
+    @property
+    def stopped(self) -> int:
+        return sum(worker.status == "stopped" for worker in self.workers)
 
     def _log(self, source: str, message: str) -> None:
         message = _safe_text(message)
@@ -1683,6 +1696,7 @@ class BatchRunner:
             "completed": completed,
             "succeeded": succeeded,
             "failed": self.failed,
+            "stopped": self.stopped,
             "active": len(self.active),
             "account_count": self.account_count,
             "failure_counts": dict(self.failure_counts),
