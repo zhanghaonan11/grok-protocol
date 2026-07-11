@@ -801,7 +801,9 @@ class EmbeddedProxyAssignmentTests(unittest.TestCase):
         self.assertTrue(svc._looks_like_proxy_failure("Connection refused by peer"))
         self.assertTrue(svc._looks_like_proxy_failure("curl: (56) Failure"))
         self.assertTrue(svc._looks_like_proxy_failure("curl: (7) Failed to connect"))
-        self.assertFalse(svc._looks_like_proxy_failure("turnstile timeout"))
+        # Bad egress often surfaces as Turnstile timeout under embedded proxy mode.
+        self.assertTrue(svc._looks_like_proxy_failure("turnstile timeout"))
+        self.assertTrue(svc._looks_like_proxy_failure("curl: (35) TLS connect error"))
         self.assertFalse(svc._looks_like_proxy_failure(""))
 
     def test_worker_proxy_failure_retries_up_to_three_nodes(self):
