@@ -45,50 +45,102 @@ def _normalize_browser_major(value: object, *, default: str = "136") -> str:
     return str(major)
 
 
+def _supported_curl_cffi_impersonate_names() -> list[str]:
+    """Return impersonate targets actually supported by the installed curl_cffi."""
+    names: list[str] = []
+    try:
+        from curl_cffi.requests.impersonate import BrowserType, DEFAULT_CHROME
+
+        for member in BrowserType:
+            value = str(getattr(member, "value", member)).strip()
+            # Skip aliases like plain "chrome" until the end.
+            if value and value not in names and value not in {"chrome", "edge", "safari", "firefox"}:
+                names.append(value)
+        default = str(DEFAULT_CHROME or "").strip()
+        if default and default not in names:
+            names.append(default)
+        for alias in ("chrome", "chrome136", "chrome142"):
+            if alias not in names:
+                names.append(alias)
+    except Exception:
+        names = ["chrome142", "chrome136", "chrome131", "chrome124", "chrome120", "chrome"]
+    return names
+
+
+def _impersonate_is_usable(name: str) -> bool:
+    """True only if curl_cffi can actually apply this impersonate target."""
+    target = str(name or "").strip()
+    if not target:
+        return False
+    try:
+        from curl_cffi import Curl
+        from curl_cffi.requests.impersonate import normalize_browser_type
+
+        # Session(...) may accept unknown strings; Curl.impersonate is authoritative.
+        normalized = normalize_browser_type(target)
+        curl = Curl()
+        try:
+            curl.impersonate(normalized)
+            return True
+        finally:
+            try:
+                curl.close()
+            except Exception:
+                pass
+    except Exception:
+        return False
+    return False
+
+
 def _impersonate_for_browser_major(major: str) -> str:
     """Pick a curl_cffi impersonate target closest to the real Chrome major."""
     try:
         major_i = int(str(major).strip() or "136")
     except ValueError:
         major_i = 136
-    # Prefer exact-ish profiles available in modern curl_cffi builds.
-    ordered = (
-        (148, ("chrome148", "chrome142", "chrome136")),
-        (142, ("chrome142", "chrome136", "chrome133a")),
-        (136, ("chrome136", "chrome133a", "chrome131")),
-        (133, ("chrome133a", "chrome131", "chrome124")),
+
+    # Map installed Chrome major -> preferred impersonate ladder.
+    # Names must exist in the installed curl_cffi BrowserType set.
+    preferred_by_bucket = (
+        (148, ("chrome142", "chrome136", "chrome133a", "chrome131")),
+        (142, ("chrome142", "chrome136", "chrome133a", "chrome131")),
+        (136, ("chrome136", "chrome133a", "chrome131", "chrome124")),
+        (133, ("chrome133a", "chrome131", "chrome124", "chrome120")),
         (131, ("chrome131", "chrome124", "chrome120")),
-        (124, ("chrome124", "chrome120")),
+        (124, ("chrome124", "chrome120", "chrome116")),
         (120, ("chrome120", "chrome116", "chrome")),
     )
-    # Choose the nearest profile bucket not newer than major when possible.
-    candidates = []
-    for bucket, names in ordered:
+    candidates: list[str] = []
+    for bucket, names in preferred_by_bucket:
         if bucket <= major_i:
             candidates.extend(names)
     if not candidates:
-        candidates = list(ordered[-1][1])
-    # Deduplicate while preserving order.
+        candidates = list(preferred_by_bucket[-1][1])
+
+    supported = set(_supported_curl_cffi_impersonate_names())
+    # Prefer preferred names that are both listed and actually usable.
     seen = set()
-    uniq = []
+    ordered: list[str] = []
     for name in candidates:
         if name in seen:
             continue
         seen.add(name)
-        uniq.append(name)
-    # Validate against installed curl_cffi if possible; fall back gracefully.
-    try:
-        from curl_cffi.requests import Session
+        ordered.append(name)
+    # Then any remaining supported chrome* profiles as a last resort.
+    for name in sorted(supported, reverse=True):
+        if name.startswith("chrome") and name not in seen:
+            ordered.append(name)
+            seen.add(name)
 
-        for name in uniq:
-            try:
-                Session(impersonate=name)
+    for name in ordered:
+        if name in supported or name == "chrome":
+            if _impersonate_is_usable(name):
                 return name
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return uniq[0] if uniq else "chrome136"
+    # Absolute fallback: never return an unsupported chrome148-like value.
+    for name in ("chrome142", "chrome136", "chrome131", "chrome120", "chrome"):
+        if _impersonate_is_usable(name):
+            return name
+    return "chrome"
 
 
 def build_canonical_fingerprint_profile(
