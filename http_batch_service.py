@@ -1196,8 +1196,8 @@ class BatchBusyError(TuiConfigError):
     """Raised when a second batch is requested while one is still active."""
 
 
-def list_runs(runs_dir: Path = RUNS_DIR, *, limit: int = 50) -> List[Dict[str, object]]:
-    root = Path(runs_dir)
+def list_runs(runs_dir: Optional[Path] = None, *, limit: int = 50) -> List[Dict[str, object]]:
+    root = Path(runs_dir or RUNS_DIR)
     if not root.is_dir():
         return []
     entries: List[Tuple[float, Path]] = []
@@ -1241,8 +1241,8 @@ def _run_summary_from_dir(run_dir: Path) -> Dict[str, object]:
     }
 
 
-def get_run_detail(run_id: str, runs_dir: Path = RUNS_DIR) -> Dict[str, object]:
-    run_dir = Path(runs_dir) / str(run_id)
+def get_run_detail(run_id: str, runs_dir: Optional[Path] = None) -> Dict[str, object]:
+    run_dir = Path(runs_dir or RUNS_DIR) / str(run_id)
     if not run_dir.is_dir():
         raise TuiConfigError(f"找不到运行记录: {run_id}")
     detail = _run_summary_from_dir(run_dir)
@@ -1254,8 +1254,8 @@ def get_run_detail(run_id: str, runs_dir: Path = RUNS_DIR) -> Dict[str, object]:
     return detail
 
 
-def resolve_run_file(run_id: str, rel_path: str, runs_dir: Path = RUNS_DIR) -> Path:
-    run_dir = (Path(runs_dir) / str(run_id)).resolve()
+def resolve_run_file(run_id: str, rel_path: str, runs_dir: Optional[Path] = None) -> Path:
+    run_dir = (Path(runs_dir or RUNS_DIR) / str(run_id)).resolve()
     if not run_dir.is_dir():
         raise TuiConfigError(f"找不到运行记录: {run_id}")
     candidate = (run_dir / str(rel_path)).resolve()

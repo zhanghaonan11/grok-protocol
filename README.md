@@ -1,3 +1,15 @@
+## WebUI 主入口（推荐）
+
+```bash
+./webui.sh
+# 浏览器打开 http://127.0.0.1:33843
+```
+
+- 仅本机绑定 `127.0.0.1`，默认端口 `33843`（可用 `XAI_WEBUI_PORT` 覆盖）
+- 同时只跑 1 个批次；含失败汇总、历史 run、浏览器残留清理
+- 旧 TUI（`./tui.sh`）仍保留作过渡
+
+
 <div align="center">
 
 [![Grok Register — GUI and CLI registration automation toolkit](assets/banner.png)](https://github.com/AaronL725/grok-register)
