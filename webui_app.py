@@ -82,10 +82,11 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request) -> HTMLResponse:
+        # Starlette/Jinja2: pass Request first, then template name, then context.
         return templates.TemplateResponse(
+            request,
             "index.html",
             {
-                "request": request,
                 "host": DEFAULT_WEBUI_HOST,
                 "port": DEFAULT_WEBUI_PORT,
             },
