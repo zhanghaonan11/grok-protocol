@@ -49,3 +49,29 @@ class LeaseTests(unittest.TestCase):
             (not m._nodes[n.id].healthy)
             or m._nodes[n.id].cooldown_until > time.time()
         )
+
+
+class ConfigGenTests(unittest.TestCase):
+    def test_build_mihomo_config_maps_ports_and_proxies(self):
+        from embedded_proxy_manager import NodeSlot, build_mihomo_config
+
+        nodes = [
+            NodeSlot(
+                id="a", name="jp", server="jp.example", port=443, protocol="vless",
+                local_http="", uuid="11111111-1111-1111-1111-111111111111",
+                params={"security": "tls", "sni": "jp.example", "type": "tcp"},
+            ),
+            NodeSlot(
+                id="b", name="hk", server="hk.example", port=443, protocol="vless",
+                local_http="", uuid="22222222-2222-2222-2222-222222222222",
+                params={"security": "reality", "sni": "www.example.com", "pbk": "PK", "sid": "abcd", "type": "tcp", "fp": "chrome"},
+            ),
+        ]
+        cfg = build_mihomo_config(nodes, listen_host="127.0.0.1", base_port=28000)
+        self.assertEqual(cfg["allow-lan"], False)
+        self.assertEqual(len(cfg["proxies"]), 2)
+        self.assertEqual(len(cfg["listeners"]), 2)
+        self.assertEqual(cfg["listeners"][0]["port"], 28000)
+        self.assertEqual(cfg["listeners"][1]["port"], 28001)
+        # 每个 listener 绑定对应 proxy
+        self.assertEqual(cfg["listeners"][0]["proxy"], cfg["proxies"][0]["name"])
