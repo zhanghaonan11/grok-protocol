@@ -887,21 +887,22 @@ class BatchRunner:
         log_handle = log_path.open("ab")
         broker_env = os.environ.copy()
         # Ensure managed broker can find a real Chrome for strict fingerprint mode.
+        browser_path = ""
         try:
-            from turnstile_solver.src.config import detect_system_chrome_path
-
-            browser_path = str(
-                (self.plan.config or {}).get("browser_path")
-                or broker_env.get("TURNSTILE_BROWSER_PATH")
-                or detect_system_chrome_path()
-                or ""
-            ).strip()
+            plan_config = _read_config(self.plan.config_path)
         except Exception:
-            browser_path = str(
-                (self.plan.config or {}).get("browser_path")
-                or broker_env.get("TURNSTILE_BROWSER_PATH")
-                or ""
-            ).strip()
+            plan_config = {}
+        if isinstance(plan_config, dict):
+            browser_path = str(plan_config.get("browser_path") or "").strip()
+        if not browser_path:
+            browser_path = str(broker_env.get("TURNSTILE_BROWSER_PATH") or "").strip()
+        if not browser_path:
+            try:
+                from turnstile_solver.src.config import detect_system_chrome_path
+
+                browser_path = str(detect_system_chrome_path() or "").strip()
+            except Exception:
+                browser_path = ""
         if browser_path:
             broker_env["TURNSTILE_BROWSER_PATH"] = browser_path
             self._log("SYSTEM", f"Turnstile broker 浏览器: {browser_path}")
