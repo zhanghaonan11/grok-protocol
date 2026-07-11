@@ -533,6 +533,53 @@ def _response_json(response: Any) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _is_loopback_url(url: str) -> bool:
+    """True for localhost/loopback broker endpoints."""
+    try:
+        host = str(urlparse(str(url or "")).hostname or "").strip().lower()
+    except Exception:
+        host = ""
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def _http_post_json(
+    url: str,
+    *,
+    json_body: Optional[Dict[str, Any]] = None,
+    timeout: float = 30,
+    impersonate: str = "",
+) -> Any:
+    """POST JSON.
+
+    Local Turnstile broker calls must NOT use curl_cffi browser impersonation:
+    chrome impersonation may send HTTP/2 upgrade headers and drop the JSON body,
+    which FastAPI then rejects as 422 "Field required".
+    """
+    timeout = max(1.0, float(timeout or 30))
+    if _is_loopback_url(url):
+        import requests as std_requests
+
+        return std_requests.post(url, json=json_body, timeout=timeout)
+    kwargs: Dict[str, Any] = {"timeout": timeout}
+    if json_body is not None:
+        kwargs["json"] = json_body
+    if impersonate:
+        kwargs["impersonate"] = impersonate
+    return requests.post(url, **kwargs)
+
+
+def _broker_http_error(stage: str, response: Any) -> VerificationRequiredError:
+    status = int(getattr(response, "status_code", 0) or 0)
+    data = _response_json(response)
+    detail = data.get("detail") if isinstance(data, dict) else None
+    if detail is not None:
+        body = _safe_error_text(detail)
+    else:
+        body = _safe_error_text(data or getattr(response, "text", "") or "")
+    return VerificationRequiredError(f"Turnstile broker {stage} HTTP {status}: {body}")
+
+
+
 def _is_cf_interstitial(response: Any) -> bool:
     text = str(getattr(response, "text", "") or "").lower()
     title_or_marker = (
@@ -1283,6 +1330,10 @@ async def _solve_request_async(request: SolveRequest, _sleep: Callable[[float], 
 
     if request.broker_url:
         endpoint = request.broker_url.rstrip("/") + "/v1/solve"
+        try:
+            expected_major = int(str(fingerprint.browser_major or "0").strip() or "0")
+        except ValueError:
+            expected_major = 0
         payload = {
             "provider": request.provider,
             "api_key": request.api_key,
@@ -1297,22 +1348,36 @@ async def _solve_request_async(request: SolveRequest, _sleep: Callable[[float], 
             "accept_language": fingerprint.accept_language,
             "expected_platform": fingerprint.navigator_platform,
             "expected_client_hint_platform": fingerprint.client_hint_platform,
-            "expected_browser_major": fingerprint.browser_major,
-            "metadata": {"action": request.action, "cdata": request.cdata},
+            # Solver API expects int; string works on some pydantic versions but keep strict.
+            "expected_browser_major": expected_major,
         }
         response = await asyncio.to_thread(
-            requests.post,
+            _http_post_json,
             endpoint,
-            json=payload,
+            json_body=payload,
             timeout=max(5, request.timeout_sec + 5),
             impersonate=fingerprint.impersonate,
         )
+        status = int(getattr(response, "status_code", 0) or 0)
         data = _response_json(response)
-        if not data.get("ok", True):
+        if not 200 <= status < 300:
+            raise _broker_http_error("solve", response)
+        if data.get("ok") is False:
             raise VerificationRequiredError(
                 f"Turnstile broker 求解失败: {_safe_error_text(data.get('error') or data)}"
             )
         token = str(data.get("token") or "").strip()
+        remote_lease_preview = data.get("lease") if isinstance(data.get("lease"), dict) else {}
+        # Local solver keeps token behind lease consume; empty token is normal when lease exists.
+        if (
+            request.provider == "local"
+            and len(token) < 80
+            and not str(remote_lease_preview.get("lease_id") or "").strip()
+        ):
+            raise VerificationRequiredError(
+                "Turnstile broker 未返回 token/lease；"
+                f"status={status} body={_safe_error_text(data or getattr(response, 'text', ''))}"
+            )
         observed_user_agent = str(data.get("user_agent") or "").strip()
         fingerprint_data = data.get("fingerprint") if isinstance(data.get("fingerprint"), dict) else {}
         response_extras = data.get("extras") if isinstance(data.get("extras"), dict) else {}
@@ -1515,7 +1580,7 @@ def _consume_remote_turnstile_lease(
     if not broker_url or not lease_id:
         return str(result.token or "").strip()
     try:
-        response = requests.post(
+        response = _http_post_json(
             f"{broker_url}/v1/leases/{quote(lease_id, safe='')}/consume",
             timeout=15,
             impersonate=fingerprint.impersonate,
@@ -1548,9 +1613,9 @@ def _acquire_remote_submit_permit(
     fingerprint: FingerprintProfile,
 ) -> str:
     try:
-        response = requests.post(
+        response = _http_post_json(
             broker_url.rstrip("/") + "/v1/permits/submit/acquire",
-            json={
+            json_body={
                 "timeout_sec": max(1, int(timeout_sec or 30)),
                 "lease_sec": max(1, int(lease_sec or 60)),
             },
@@ -1579,7 +1644,7 @@ def _release_remote_submit_permit(
     *,
     fingerprint: FingerprintProfile,
 ) -> None:
-    response = requests.post(
+    response = _http_post_json(
         broker_url.rstrip("/")
         + f"/v1/permits/submit/{quote(str(permit_id or ''), safe='')}/release",
         timeout=15,
