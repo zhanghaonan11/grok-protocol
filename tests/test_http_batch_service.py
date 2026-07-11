@@ -36,7 +36,9 @@ class HttpBatchServiceSmokeTests(unittest.TestCase):
                 config=svc._read_config(cfg),
             )
             plan = svc.build_plan(settings)
-            self.assertLessEqual(plan.workers, svc.MAX_LOCAL_TURNSTILE_WORKERS)
+            # Account concurrency is independent; only Turnstile browser slots are capped.
+            self.assertEqual(plan.workers, 10)
+            self.assertLessEqual(plan.turnstile_workers, svc.MAX_LOCAL_TURNSTILE_WORKERS)
 
     def test_build_plan_local_uses_configured_cap(self):
         with tempfile.TemporaryDirectory() as d:
@@ -67,7 +69,8 @@ class HttpBatchServiceSmokeTests(unittest.TestCase):
                 config=svc._read_config(cfg),
             )
             plan = svc.build_plan(settings)
-            self.assertEqual(plan.workers, 8)
+            self.assertEqual(plan.workers, 10)
+            self.assertEqual(plan.turnstile_workers, 8)
             self.assertTrue(any("local_turnstile_max_workers" in w for w in plan.warnings))
             self.assertTrue(any("YYDS" in w for w in plan.warnings))
             self.assertFalse(

@@ -51,3 +51,6 @@ autoPortData/
 # Protocol analysis / capture reports (local-only research notes)
 *协议分析报告.md
 grok-*-协议分析*.md
+
+# Embedded mihomo runtime
+.embedded_mihomo/
