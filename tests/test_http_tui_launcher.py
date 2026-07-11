@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import http_batch_service as batch_service
 import http_tui as tui
 
 
@@ -142,7 +143,7 @@ print('[HTTP] fake backend completed', flush=True)
                 proxy_mode="none",
                 proxy_args=[],
             )
-            with mock.patch.object(tui, "ROOT_DIR", root), mock.patch.object(tui, "RUNS_DIR", root / "runs"):
+            with mock.patch.object(batch_service, "ROOT_DIR", root), mock.patch.object(batch_service, "RUNS_DIR", root / "runs"), mock.patch.object(tui, "ROOT_DIR", root), mock.patch.object(tui, "RUNS_DIR", root / "runs"):
                 runner = tui.BatchRunner(plan)
                 runner.start()
                 deadline = time.monotonic() + 5
@@ -217,7 +218,7 @@ print('[HTTP] fake backend completed', flush=True)
                 proxy_mode="none",
                 proxy_args=[],
             )
-            with mock.patch.object(tui, "ROOT_DIR", root), mock.patch.object(tui, "RUNS_DIR", root / "runs"):
+            with mock.patch.object(batch_service, "ROOT_DIR", root), mock.patch.object(batch_service, "RUNS_DIR", root / "runs"), mock.patch.object(tui, "ROOT_DIR", root), mock.patch.object(tui, "RUNS_DIR", root / "runs"):
                 runner = tui.BatchRunner(plan)
                 runner.start()
                 deadline = time.monotonic() + 5
@@ -338,7 +339,7 @@ print('[HTTP] fake backend completed', flush=True)
                 proxy_mode="none",
                 proxy_args=[],
             )
-            with mock.patch.object(tui, "ROOT_DIR", root), mock.patch.object(tui, "RUNS_DIR", root / "runs"):
+            with mock.patch.object(batch_service, "ROOT_DIR", root), mock.patch.object(batch_service, "RUNS_DIR", root / "runs"), mock.patch.object(tui, "ROOT_DIR", root), mock.patch.object(tui, "RUNS_DIR", root / "runs"):
                 runner = tui.BatchRunner(plan)
                 runner.start()
                 saw_parallel_convert = False
@@ -407,7 +408,7 @@ print('[HTTP] fake backend completed', flush=True)
                 sso_convert_retries=5,
                 sso_convert_cooldown=0,
             )
-            with mock.patch.object(tui, "ROOT_DIR", root), mock.patch.object(tui, "RUNS_DIR", root / "runs"):
+            with mock.patch.object(batch_service, "ROOT_DIR", root), mock.patch.object(batch_service, "RUNS_DIR", root / "runs"), mock.patch.object(tui, "ROOT_DIR", root), mock.patch.object(tui, "RUNS_DIR", root / "runs"):
                 runner = tui.BatchRunner(plan)
                 runner.start()
                 deadline = time.monotonic() + 8
@@ -475,7 +476,7 @@ print('[HTTP] fake backend completed', flush=True)
             (root / "playwright_chromiumdev_profile-ddd").mkdir()
             (root / "keep-me").mkdir()
 
-            with mock.patch.object(tui, "_pgrep_count", side_effect=[12, 34]):
+            with mock.patch.object(batch_service, "_pgrep_count", side_effect=[12, 34]):
                 status = tui.browser_health_status()
             self.assertEqual(status["chrome_count"], 12)
             self.assertEqual(status["playwright_count"], 34)
