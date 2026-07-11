@@ -1,0 +1,8 @@
+# Outlook / Hotmail Graph mail pool (one account per line)
+# Format: email----password----client_id----refresh_token
+# password is unused by Graph read; keep for your records
+# client_id is the Azure public app id that issued the refresh_token
+# refresh_token usually starts with M.C
+#
+# Example (fake values only):
+user@example.com----AppPasswordHere----00000000-0000-0000-0000-000000000000----M.C_REPLACE_WITH_YOUR_REFRESH_TOKEN

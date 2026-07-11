@@ -36,10 +36,13 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - [安装](#安装)
 - [配置](#配置)
 - [运行](#运行)
+- [无浏览器 HTTP 模式](#无浏览器-http-模式)
+- [完整使用指南](#完整使用指南)
 - [输出文件](#输出文件)
 - [稳定性机制](#稳定性机制)
 - [常见问题](#常见问题)
 - [目录结构](#目录结构)
+- [分享前注意](#分享前注意)
 - [License](#license)
 - [Acknowledgments](#acknowledgments)
 - [Star History](#star-history)
@@ -49,6 +52,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - 支持 GUI 图形界面运行。
 - 支持 CLI 终端运行，不启动 Tk GUI。
 - 注册流程使用 Chromium/Chrome 浏览器页面完成。
+- 支持独立的无浏览器 HTTP 注册、SSO 会话导入和 OAuth 凭证获取命令。
 - 支持 DuckMail、YYDS、Cloudflare 临时邮箱接口。
 - 支持验证码邮件轮询和解析。
 - 支持成功账号实时写入 `accounts_*.txt`。
@@ -94,6 +98,7 @@ cp config.example.json config.json
 | `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare` |
 | `register_count` | 本次目标注册数量 |
 | `proxy` | 代理地址，可留空 |
+| `proxy_parent` | 可选父 HTTP 代理；设置后本地转发器会先经它 CONNECT 到认证上游，例如 Clash `http://127.0.0.1:7890` |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 地址 |
 | `cloudflare_api_key` | Cloudflare 临时邮箱接口密钥；默认匿名模式留空，admin 模式填 `ADMIN_PASSWORD` |
@@ -108,6 +113,8 @@ cp config.example.json config.json
 | `grok2api_auto_add_remote` | 是否写入远端 grok2api |
 | `grok2api_remote_base` | 远端 grok2api 地址，可填站点根地址或 `/admin/api` 管理 API 地址 |
 | `grok2api_remote_app_key` | 远端 grok2api app key |
+| `turnstile_provider` | HTTP 流验证码服务：`capsolver`、`yescaptcha`、`2captcha` |
+| `turnstile_api_key` | HTTP 流验证码服务 API key；也可优先通过环境变量传入 |
 
 ### Cloudflare 临时邮箱匿名模式（默认）
 
@@ -208,6 +215,90 @@ Ctrl+C
 
 CLI 模式适合长时间批量运行。程序每成功注册 5 个账号会关闭浏览器、清理运行时对象并重新启动浏览器，降低长任务内存占用。
 
+### 无浏览器 HTTP 模式
+
+`http` 子命令不会导入 Tk、DrissionPage 或启动 Chrome。它直接维护 xAI 的跨域 Cookie、调用注册/邮箱验证码/OAuth consent 接口，并将 OAuth 凭证写成 CLIProxyAPI 兼容的 JSON：
+
+```bash
+python grok_register_ttk.py http --help
+```
+
+已存在 SSO 会话时，只获取凭证：
+
+```bash
+python grok_register_ttk.py http credential --sso-file sso.txt --output-dir xai_credentials
+```
+
+完整注册可使用 `config.json` 邮箱服务商创建/轮询验证码（`yyds` / `cloudflare` / `msgraph`），或 Outlook 四段文件（格式见 `need/outlook_mail.example.txt`）：
+
+```bash
+# 探测邮箱（不注册）
+python grok_register_ttk.py http mail-probe --mail-config config.json
+
+# 推荐：captcha 服务 + 邮箱配置，无浏览器
+python grok_register_ttk.py http register \
+  --proxy-file proxies.txt --proxy-random \
+  --proxy-parent http://127.0.0.1:7890 \
+  --mail-config config.json \
+  --turnstile-provider yescaptcha \
+  --turnstile-api-key "$YESCAPTCHA_KEY" \
+  --output-dir xai_credentials
+```
+
+Turnstile 也可改用浏览器捕获（会开 Chrome），见 [USAGE.md](USAGE.md)。
+
+支持的 captcha provider：`yescaptcha`、`capsolver`、`2captcha`（环境变量：`XAI_TURNSTILE_PROVIDER`、`XAI_TURNSTILE_API_KEY` 等）。
+
+### HTTP TUI 启动器
+
+`http_tui.sh` 是无浏览器 HTTP 模式的全屏终端启动器，使用 Python 标准库 `curses`，不需要新增依赖。启动页可编辑配置文件、注册数量、并发数、OAuth 输出目录和代理模式；开始后左侧固定渲染批次进度和 worker 状态，右侧实时滚动每个协议子进程的后端日志。每个并发任务独立运行协议注册，不会启动 Chrome。
+
+```bash
+chmod +x http_tui.sh
+./http_tui.sh
+```
+
+可先检查运行计划，不发送任何请求：
+
+```bash
+./http_tui.sh --config config.json --count 3 --workers 2 --dry-run
+```
+
+TUI 的数量和并发只影响本次运行，不会改写 `config.json`。批次日志会写入已忽略的 `http_runs/`，成功账号汇总为 `accounts_http_*.txt`。
+
+运行页快捷键：`q` 停止/退出，`↑` / `↓` 滚动右侧日志，`l` 回到最新日志。建议终端尺寸至少为 80x20。
+
+### CapSolver Turnstile
+
+CapSolver 接入使用其 `createTask` / `getTaskResult` API。优先通过环境变量提供密钥，避免把密钥写入 `config.json`：
+
+```bash
+export CAPSOLVER_API_KEY="你的 CapSolver API key"
+
+python grok_register_ttk.py http register \
+  --mail-config config.json \
+  --turnstile-provider capsolver \
+  --output-dir xai_credentials
+```
+
+实现遵循 CapSolver 当前 Turnstile 文档，提交 `AntiTurnstileTaskProxyLess`，并在页面声明时转发 `data-action` 与 `data-cdata`。该任务类型不接收自定义代理；即使注册 HTTP 流配置了 `--proxy`，CapSolver 求解任务仍会以 proxyless 方式创建，日志会明确提示这一点。
+
+注册成功默认写 `accounts_http_*.txt`（`email----password----sso`）与 OAuth JSON；**均含敏感信息，勿提交**。
+
+HTTP 模式不伪造 Turnstile/Castle：需 captcha 服务或 token 文件。Castle 按可选字段转发。注册会先 `VerifyEmailValidationCode` 再提交 Server Action。
+
+已有 SSO 只取凭证：
+
+```bash
+python grok_register_ttk.py http credential --sso-file sso.txt --output-dir xai_credentials
+```
+
+## 完整使用指南
+
+人读 / AI agent 共用的完整说明（系统图、配置表、验收日志、故障表、Agent 契约）：
+
+**→ [USAGE.md](USAGE.md)**
+
 ### GUI 模式
 
 ```bash
@@ -252,12 +343,25 @@ GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `r
 
 ```text
 .
-├── grok_register_ttk.py   # 主程序
-├── cf_mail_debug.py       # Cloudflare 邮箱调试工具
-├── config.example.json    # 配置示例
-├── requirements.txt       # Python 依赖
+├── grok_register_ttk.py   # 主程序（GUI / CLI / http 入口）
+├── xai_http_flow.py       # 无浏览器 HTTP 注册与 OAuth 凭证
+├── xai_oauth.py           # OAuth PKCE / token
+├── turnstile_flow.py      # 浏览器页 Turnstile 状态机
+├── local_proxy_forwarder.py
+├── cf_mail_debug.py
+├── config.example.json
+├── need/                  # 仅示例；真实池文件勿提交
+├── tests/
+├── USAGE.md               # 完整使用指南（人类 + AI）
+├── requirements.txt
 └── README.md
 ```
+
+## 分享前注意
+
+1. 只提交/打包源码与示例；**不要**带上 `config.json`、`proxies.txt`、`accounts_*`、`xai_credentials/`、真实 `need/*` 池、抓包 JSON。  
+2. `config.json` 从 `config.example.json` 复制后本地填写。  
+3. 分享前可用 `USAGE.md` 第 1 节自检命令扫一遍密钥残留。
 
 ## License
 

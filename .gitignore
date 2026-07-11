@@ -7,17 +7,43 @@ __pycache__/
 venv/
 env/
 
-accounts_*.txt
-mail_credentials.txt
-*.txt
-!requirements.txt
-
+# Local secrets and runtime outputs
 config.json
 config.local.json
-
+accounts_*.txt
+mail_credentials.txt
+xai_credentials/
+http_runs/
+xai-*.json
+proxies.txt
 *.log
+.grok_proxy_health.json
+.grok_register_stats.json
+.grok_register_worker_state/
+backups/
+.pytest_cache/
+
+# Captures / private dumps (may contain cookies, passwords, tokens)
+need/*
+!need/*.example.txt
+!need/README.md
+grok-*-*.json
+*recorder*.json
+*capture*.json
+turnstile.txt
+turnstile.proxy.txt
+sso.txt
+*.used
+
+# Keep only requirements.txt among plain text lists
+*.txt
+!requirements.txt
+!need/*.example.txt
+
 .DS_Store
 .idea/
 .vscode/
+*.swp
+*.swo
 DrissionPage/
 autoPortData/

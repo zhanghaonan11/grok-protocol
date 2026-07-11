@@ -1,0 +1,16 @@
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "max_concurrency": 2,
+  "browser_timeout_sec": 180,
+  "token_min_length": 80,
+  "signup_url": "https://accounts.x.ai/sign-up?redirect=grok-com",
+  "headless": false,
+  "proxy": "",
+  "parent_proxy": "",
+  "proxy_file": "",
+  "local_proxy_port": 0,
+  "user_agent": "",
+  "enable_metrics": true,
+  "notes": "Phase 1 uses DrissionPage + optional local_proxy_forwarder for auth proxies."
+}

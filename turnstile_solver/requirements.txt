@@ -1,0 +1,14 @@
+# Local Turnstile token factory deps (dedicated solver service)
+# Keep this separate from the root browser/register requirements.
+
+# HTTP API
+fastapi>=0.115.0
+uvicorn>=0.30.0
+pydantic>=2.7.0
+
+# Browser automation options (pick one during implementation)
+# playwright>=1.44.0
+# DrissionPage is already used by the parent project for capture flows.
+
+# Shared with parent project when integrating:
+# curl_cffi

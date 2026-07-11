@@ -1,0 +1,4 @@
+# Copy to proxies.txt or pass with --proxy-file
+# host:port:username:password
+gate.example-proxy.com:1000:user:pass-US-session001
+gate.example-proxy.com:1000:user:pass-US-session002
