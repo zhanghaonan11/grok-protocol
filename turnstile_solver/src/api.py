@@ -23,7 +23,7 @@ class SolveBody(BaseModel):  # type: ignore[misc,valid-type]
     proxy: str = ""
     parent_proxy: str = ""
     page_url: str = ""
-    timeout_sec: int = 180
+    timeout_sec: int = 30
     headless: bool = False
     user_agent: str = ""
     accept_language: str = ""

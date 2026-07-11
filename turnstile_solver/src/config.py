@@ -87,7 +87,7 @@ class SolverConfig:
     host: str = "127.0.0.1"
     port: int = 8787
     max_concurrency: int = 2
-    browser_timeout_sec: int = 180
+    browser_timeout_sec: int = 30
     token_min_length: int = 80
     signup_url: str = DEFAULT_SIGNUP_URL
     headless: bool = False
@@ -123,7 +123,14 @@ class SolverConfig:
             host=str(data.get("host") or "127.0.0.1"),
             port=int(data.get("port") or 8787),
             max_concurrency=max(1, int(data.get("max_concurrency") or 2)),
-            browser_timeout_sec=max(30, int(data.get("browser_timeout_sec") or 180)),
+            browser_timeout_sec=max(
+                5,
+                int(
+                    data.get("browser_timeout_sec")
+                    or data.get("turnstile_solve_timeout")
+                    or 30
+                ),
+            ),
             token_min_length=max(20, int(data.get("token_min_length") or 80)),
             signup_url=str(data.get("signup_url") or DEFAULT_SIGNUP_URL),
             headless=bool(data.get("headless") or False),
@@ -144,7 +151,14 @@ class SolverConfig:
                 1, int(data.get("browser_max_consecutive_failures") or 2)
             ),
             lease_ttl_sec=max(1, min(240, int(data.get("lease_ttl_sec") or 240))),
-            queue_timeout_sec=max(1, int(data.get("queue_timeout_sec") or 180)),
+            queue_timeout_sec=max(
+                1,
+                int(
+                    data.get("queue_timeout_sec")
+                    or data.get("turnstile_solve_timeout")
+                    or 30
+                ),
+            ),
             strict_fingerprint=bool(data.get("strict_fingerprint", True)),
             locale=str(data.get("locale") or ""),
             accept_language=str(data.get("accept_language") or ""),

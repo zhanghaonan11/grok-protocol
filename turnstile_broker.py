@@ -235,7 +235,7 @@ class SolveRequest:
     proxy: str = ""
     action: str = ""
     cdata: str = ""
-    timeout_sec: int = 180
+    timeout_sec: int = 30
     headless: bool = False
     fingerprint: Optional[FingerprintProfile] = None
     broker_url: str = ""

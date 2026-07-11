@@ -231,7 +231,7 @@ class SolveRequest:
     api_key: str = field(default="", repr=False)
     proxy: str = ""
     page_url: str = ""
-    timeout_sec: int = 180
+    timeout_sec: int = 30
     headless: bool = False
     user_agent: str = ""
     accept_language: str = ""

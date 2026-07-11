@@ -982,7 +982,7 @@ def solve_turnstile_token(
     api_key = _turnstile_api_key(provider, api_key)
     action = str(action or "").strip()
     cdata = str(cdata or "").strip()
-    timeout = max(30, int(timeout or 180))
+    timeout = max(5, int(timeout or 30))
 
     if provider == "local":
         _log(
@@ -1579,7 +1579,7 @@ def solve_turnstile_result(
     proxy: str = "",
     action: str = "",
     cdata: str = "",
-    timeout: int = 180,
+    timeout: int = 30,
     headless: bool = False,
     fingerprint: Optional[FingerprintProfile] = None,
     broker: Optional[TurnstileBroker] = None,
@@ -4870,7 +4870,7 @@ def capture_turnstile_token(
     output: str = "turnstile.txt",
     proxy_used_file: str = "",
     selected_proxy_raw: str = "",
-    timeout: int = 180,
+    timeout: int = 30,
     headless: bool = False,
     page_url: str = "",
     click_email_signup: bool = True,
