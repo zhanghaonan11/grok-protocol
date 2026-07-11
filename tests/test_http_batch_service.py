@@ -243,6 +243,57 @@ class ConfigCenterTests(unittest.TestCase):
             self.assertEqual(disk["tui_proxy_mode"], "pool")
             self.assertIn("2.2.2.2:8080:user:pass", pool.read_text(encoding="utf-8"))
 
+    def test_config_center_reads_and_writes_local_turnstile_max_workers(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                        "local_turnstile_max_workers": 4,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            data = service.get_config_center()
+            self.assertEqual(data["fields"]["local_turnstile_max_workers"], 4)
+
+            updated = service.update_config_center(
+                {"fields": {"local_turnstile_max_workers": 9}}
+            )
+            self.assertEqual(updated["fields"]["local_turnstile_max_workers"], 9)
+            disk = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(disk["local_turnstile_max_workers"], 9)
+
+    def test_config_center_rejects_invalid_local_turnstile_max_workers(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            with self.assertRaises(svc.TuiConfigError):
+                service.update_config_center({"fields": {"local_turnstile_max_workers": 0}})
+            with self.assertRaises(svc.TuiConfigError):
+                service.update_config_center({"fields": {"local_turnstile_max_workers": 7000}})
+            with self.assertRaises(svc.TuiConfigError):
+                service.update_config_center({"fields": {"local_turnstile_max_workers": "abc"}})
 
 
 class ProxyPoolTestTests(unittest.TestCase):

@@ -1605,6 +1605,7 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
             "turnstile_provider": settings.turnstile_provider,
             "turnstile_api_key": str(raw.get("turnstile_api_key") or ""),
             "turnstile_headless": bool(settings.turnstile_headless),
+            "local_turnstile_max_workers": resolve_local_turnstile_max_workers(raw, strict=False),
             "duckmail_api_key": str(raw.get("duckmail_api_key") or ""),
             "cloudflare_api_base": str(raw.get("cloudflare_api_base") or ""),
             "cloudflare_api_key": str(raw.get("cloudflare_api_key") or ""),
@@ -1796,6 +1797,12 @@ class BatchService:
                 minimum=1,
                 maximum=65535,
                 default=int(cfg.get("local_proxy_port") or 17890),
+            )
+
+        if "local_turnstile_max_workers" in fields:
+            cfg["local_turnstile_max_workers"] = resolve_local_turnstile_max_workers(
+                {"local_turnstile_max_workers": fields.get("local_turnstile_max_workers")},
+                strict=True,
             )
 
         # Secrets from config-center are plaintext-editable.
