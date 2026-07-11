@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
@@ -24,6 +25,25 @@ class SolverConfig:
     local_proxy_port: int = 0
     user_agent: str = ""
     enable_metrics: bool = True
+    browser_max_tasks: int = 25
+    browser_max_age_sec: int = 1800
+    browser_idle_ttl_sec: int = 600
+    browser_maintenance_interval_sec: float = 5.0
+    # Chrome process-tree RSS; shared pages may be counted in multiple children.
+    # 2048 MiB is a conservative default rather than a per-process hard limit.
+    browser_max_rss_mb: int = 2048
+    browser_max_consecutive_failures: int = 2
+    lease_ttl_sec: int = 240
+    queue_timeout_sec: int = 180
+    strict_fingerprint: bool = True
+    locale: str = ""
+    accept_language: str = ""
+    external_provider_workers: int = 20
+    external_queue_limit: int = 64
+    submit_workers: int = 5
+    submit_permit_lease_sec: int = 120
+    browser_path: str = ""
+    no_sandbox: bool = False
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SolverConfig":
@@ -41,6 +61,63 @@ class SolverConfig:
             local_proxy_port=int(data.get("local_proxy_port") or 0),
             user_agent=str(data.get("user_agent") or ""),
             enable_metrics=bool(data.get("enable_metrics", True)),
+            browser_max_tasks=max(1, int(data.get("browser_max_tasks") or 25)),
+            browser_max_age_sec=max(60, int(data.get("browser_max_age_sec") or 1800)),
+            browser_idle_ttl_sec=max(0, int(data.get("browser_idle_ttl_sec") or 600)),
+            browser_maintenance_interval_sec=max(
+                0.05, float(data.get("browser_maintenance_interval_sec") or 5.0)
+            ),
+            browser_max_rss_mb=max(0, int(data.get("browser_max_rss_mb") or 2048)),
+            browser_max_consecutive_failures=max(
+                1, int(data.get("browser_max_consecutive_failures") or 2)
+            ),
+            lease_ttl_sec=max(1, min(240, int(data.get("lease_ttl_sec") or 240))),
+            queue_timeout_sec=max(1, int(data.get("queue_timeout_sec") or 180)),
+            strict_fingerprint=bool(data.get("strict_fingerprint", True)),
+            locale=str(data.get("locale") or ""),
+            accept_language=str(data.get("accept_language") or ""),
+            external_provider_workers=max(1, int(data.get("external_provider_workers") or 20)),
+            external_queue_limit=max(1, int(data.get("external_queue_limit") or 64)),
+            submit_workers=max(1, int(data.get("submit_workers") or 5)),
+            submit_permit_lease_sec=max(
+                1, int(data.get("submit_permit_lease_sec") or 120)
+            ),
+            browser_path=str(data.get("browser_path") or ""),
+            no_sandbox=bool(data.get("no_sandbox", False)),
+        )
+
+    def resolved_browser_path(self) -> str:
+        raw = str(os.environ.get("TURNSTILE_BROWSER_PATH") or self.browser_path or "").strip()
+        if not raw:
+            if self.strict_fingerprint:
+                raise ValueError(
+                    "严格指纹模式必须通过 browser_path 或 TURNSTILE_BROWSER_PATH 指定浏览器"
+                )
+            return ""
+        path = Path(raw).expanduser()
+        if self.strict_fingerprint:
+            if not path.is_absolute():
+                raise ValueError(f"严格指纹模式 browser_path 必须是绝对路径: {path}")
+            if not path.is_file():
+                raise ValueError(f"严格指纹模式 browser_path 不是可执行文件: {path}")
+            if not os.access(str(path), os.X_OK):
+                raise ValueError(f"严格指纹模式 browser_path 不可执行: {path}")
+        try:
+            return str(path.resolve(strict=False))
+        except OSError:
+            return str(path)
+
+    def resolved_no_sandbox(self) -> bool:
+        raw = os.environ.get("TURNSTILE_NO_SANDBOX")
+        if raw is None or not str(raw).strip():
+            return bool(self.no_sandbox)
+        value = str(raw).strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(
+            "TURNSTILE_NO_SANDBOX 必须是 1/0、true/false、yes/no 或 on/off"
         )
 
 

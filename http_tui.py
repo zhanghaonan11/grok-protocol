@@ -16,11 +16,14 @@ import os
 import queue
 import shutil
 import re
+import socket
 import subprocess
 import sys
 import threading
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +37,8 @@ RUNS_DIR = ROOT_DIR / "http_runs"
 MAX_COUNT = 1000
 MAX_WORKERS = 32
 MAX_LOCAL_TURNSTILE_WORKERS = 3
+DEFAULT_TURNSTILE_QUEUE_SIZE = 64
+DEFAULT_SUBMIT_WORKERS = 4
 MAX_LOG_LINES = 700
 DEFAULT_SSO_CONVERT_RETRIES = 5
 DEFAULT_SSO_CONVERT_COOLDOWN = 3
@@ -219,6 +224,10 @@ class Settings:
     no_proxy: bool = False
     turnstile_provider: str = "capsolver"
     turnstile_headless: bool = False
+    turnstile_workers: int = 0
+    turnstile_queue_size: int = DEFAULT_TURNSTILE_QUEUE_SIZE
+    submit_workers: int = DEFAULT_SUBMIT_WORKERS
+    turnstile_broker_url: str = ""
     sso_convert_retries: int = DEFAULT_SSO_CONVERT_RETRIES
     sso_convert_cooldown: int = DEFAULT_SSO_CONVERT_COOLDOWN
     config: Dict[str, object] = field(default_factory=dict)
@@ -236,6 +245,11 @@ class RunPlan:
     proxy_mode: str
     proxy_args: List[str]
     turnstile_headless: bool = False
+    turnstile_workers: int = 1
+    turnstile_queue_size: int = DEFAULT_TURNSTILE_QUEUE_SIZE
+    submit_workers: int = DEFAULT_SUBMIT_WORKERS
+    turnstile_broker_url: str = ""
+    manage_turnstile_broker: bool = False
     sso_convert_retries: int = DEFAULT_SSO_CONVERT_RETRIES
     sso_convert_cooldown: int = DEFAULT_SSO_CONVERT_COOLDOWN
     warnings: List[str] = field(default_factory=list)
@@ -617,10 +631,9 @@ def build_plan(settings: Settings) -> RunPlan:
                 f"{MAX_LOCAL_TURNSTILE_WORKERS}。"
             )
         if workers > MAX_LOCAL_TURNSTILE_WORKERS:
-            workers = MAX_LOCAL_TURNSTILE_WORKERS
             warnings.append(
-                f"本地浏览器 Turnstile 已将并发限制为 {MAX_LOCAL_TURNSTILE_WORKERS}，"
-                "避免 YYDS 建邮限流和本机浏览器资源打满。"
+                f"本地浏览器 Turnstile 独立限制为 {MAX_LOCAL_TURNSTILE_WORKERS}；"
+                "账号任务并发不再被该限制覆盖。"
             )
 
     is_graph = email_provider in {"msgraph", "microsoft", "hotmail", "outlook"}
@@ -640,6 +653,24 @@ def build_plan(settings: Settings) -> RunPlan:
         )
 
     proxy_mode, proxy_args = _resolve_proxy_args(settings)
+    requested_turnstile_workers = int(
+        settings.turnstile_workers or config.get("turnstile_workers") or
+        (MAX_LOCAL_TURNSTILE_WORKERS if provider == "local" else workers)
+    )
+    turnstile_workers = max(1, min(MAX_WORKERS, requested_turnstile_workers))
+    if provider == "local":
+        turnstile_workers = min(turnstile_workers, MAX_LOCAL_TURNSTILE_WORKERS)
+    turnstile_queue_size = max(
+        1,
+        int(config.get("turnstile_queue_size") or settings.turnstile_queue_size or DEFAULT_TURNSTILE_QUEUE_SIZE),
+    )
+    submit_workers = max(
+        1,
+        min(MAX_WORKERS, int(config.get("submit_workers") or settings.submit_workers or DEFAULT_SUBMIT_WORKERS)),
+    )
+    turnstile_broker_url = str(
+        settings.turnstile_broker_url or config.get("turnstile_broker_url") or ""
+    ).strip()
     run_mode = _normalize_run_mode(settings.run_mode)
     sso_convert_retries = _bounded_int(
         settings.sso_convert_retries,
@@ -672,6 +703,11 @@ def build_plan(settings: Settings) -> RunPlan:
         proxy_mode=proxy_mode,
         proxy_args=proxy_args,
         turnstile_headless=turnstile_headless,
+        turnstile_workers=turnstile_workers,
+        turnstile_queue_size=turnstile_queue_size,
+        submit_workers=submit_workers,
+        turnstile_broker_url=turnstile_broker_url,
+        manage_turnstile_broker=not bool(turnstile_broker_url),
         sso_convert_retries=sso_convert_retries,
         sso_convert_cooldown=sso_convert_cooldown,
         warnings=warnings,
@@ -687,6 +723,8 @@ def describe_plan(plan: RunPlan, *, dry_run: bool = False) -> str:
         f"Turnstile: {_turnstile_provider_label(plan.provider, headless=plan.turnstile_headless)}",
         f"注册数量: {plan.count}",
         f"并发数: {plan.workers}",
+        f"Turnstile并发: {plan.turnstile_workers} / 队列: {plan.turnstile_queue_size}",
+        f"提交并发: {plan.submit_workers}",
         f"代理: {_proxy_mode_label(plan.proxy_mode)}",
         f"OAuth 输出: {plan.output_dir}",
     ]
@@ -723,6 +761,94 @@ class BatchRunner:
         self.next_index = 0
         self.summary_path: Optional[Path] = None
         self.account_count = 0
+        self.broker_process: Optional[subprocess.Popen[str]] = None
+        self.owns_broker = False
+
+    @staticmethod
+    def _free_loopback_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    def _shared_broker_command(self, port: int) -> List[str]:
+        return [
+            sys.executable,
+            "-m",
+            "turnstile_solver.src",
+            "serve",
+            "--config",
+            str(self.plan.config_path),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--max-concurrency",
+            str(self.plan.turnstile_workers),
+            "--external-provider-workers",
+            str(self.plan.turnstile_workers),
+            "--external-queue-limit",
+            str(self.plan.turnstile_queue_size),
+            "--submit-workers",
+            str(self.plan.submit_workers),
+        ]
+
+    def _start_shared_broker(self) -> None:
+        if self.plan.turnstile_broker_url or not self.plan.manage_turnstile_broker:
+            return
+        port = self._free_loopback_port()
+        url = f"http://127.0.0.1:{port}"
+        command = self._shared_broker_command(port)
+        process = subprocess.Popen(
+            command,
+            cwd=str(ROOT_DIR),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        deadline = time.monotonic() + 30.0
+        last_error = ""
+        while time.monotonic() < deadline:
+            return_code = process.poll()
+            if return_code is not None:
+                last_error = f"进程提前退出，退出码 {return_code}"
+                break
+            try:
+                with urllib.request.urlopen(url + "/health", timeout=1.0) as response:
+                    if 200 <= int(getattr(response, "status", 0) or 0) < 300:
+                        self.broker_process = process
+                        self.owns_broker = True
+                        self.plan.turnstile_broker_url = url
+                        self._log("SYSTEM", f"共享 Turnstile broker 已就绪: {url}")
+                        return
+            except (OSError, urllib.error.URLError) as exc:
+                last_error = str(exc)
+            time.sleep(0.1)
+        try:
+            process.terminate()
+            process.wait(timeout=3)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        raise TuiConfigError(f"共享 Turnstile broker 启动失败: {last_error or 'health timeout'}")
+
+    def _stop_shared_broker(self) -> None:
+        process = self.broker_process
+        self.broker_process = None
+        if not self.owns_broker or process is None:
+            return
+        self.owns_broker = False
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                process.kill()
+                process.wait(timeout=2)
+            except Exception:
+                pass
+        self._log("SYSTEM", "共享 Turnstile broker 已关闭")
 
     @property
     def active(self) -> List[WorkerState]:
@@ -757,6 +883,7 @@ class BatchRunner:
                 os.chmod(directory, 0o700)
             except OSError:
                 pass
+        self._start_shared_broker()
         self.started = True
         self._log("SYSTEM", "HTTP 协议批量任务已启动（邮箱/OTP/注册走协议；仅 local Turnstile 会临时开浏览器）")
         for warning in self.plan.warnings:
@@ -779,6 +906,11 @@ class BatchRunner:
         ]
         if self.plan.provider == "local" and self.plan.turnstile_headless:
             command.append("--turnstile-headless")
+        command.extend(["--turnstile-workers", str(self.plan.turnstile_workers)])
+        command.extend(["--turnstile-queue-size", str(self.plan.turnstile_queue_size)])
+        command.extend(["--submit-workers", str(self.plan.submit_workers)])
+        if self.plan.turnstile_broker_url:
+            command.extend(["--turnstile-broker-url", self.plan.turnstile_broker_url])
         # 模式1：仓库内 PKCE OAuth。
         # 模式2：显式传空 output-dir，关闭注册内置换票，改由 sso_to_auth_json 一对一转换。
         if self.plan.run_mode == RUN_MODE_REGISTER_OTP:
@@ -1045,25 +1177,30 @@ class BatchRunner:
     def _finalize(self) -> None:
         if self.done:
             return
-        summary = ROOT_DIR / f"accounts_http_{self.run_id}.txt"
-        lines: List[str] = []
-        for worker in self.workers:
-            if not worker.accounts_path or not worker.accounts_path.is_file():
-                continue
-            try:
-                lines.extend(
-                    line for line in worker.accounts_path.read_text(encoding="utf-8").splitlines() if line.strip()
-                )
-            except OSError as exc:
-                self._log("SYSTEM", f"无法读取工作线程账号文件: {exc}")
-        if lines:
-            summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            try:
-                os.chmod(summary, 0o600)
-            except OSError:
-                pass
-            self.summary_path = summary
-            self.account_count = len(lines)
+        try:
+            summary = ROOT_DIR / f"accounts_http_{self.run_id}.txt"
+            lines: List[str] = []
+            for worker in self.workers:
+                if not worker.accounts_path or not worker.accounts_path.is_file():
+                    continue
+                try:
+                    lines.extend(
+                        line
+                        for line in worker.accounts_path.read_text(encoding="utf-8").splitlines()
+                        if line.strip()
+                    )
+                except OSError as exc:
+                    self._log("SYSTEM", f"无法读取工作线程账号文件: {exc}")
+            if lines:
+                summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                try:
+                    os.chmod(summary, 0o600)
+                except OSError:
+                    pass
+                self.summary_path = summary
+                self.account_count = len(lines)
+        finally:
+            self._stop_shared_broker()
         self.done = True
         self._log(
             "SYSTEM",
@@ -1099,6 +1236,7 @@ class BatchRunner:
             elif worker.status == "converting":
                 worker.last_log = "停止中：等待当前 SSO 转换收尾"
                 self._log(f"W{worker.index:02d}", worker.last_log)
+        self._stop_shared_broker()
 
     def exit_code(self) -> int:
         return 0 if self.done and self.failed == 0 else 2

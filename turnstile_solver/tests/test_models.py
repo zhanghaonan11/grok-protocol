@@ -17,6 +17,9 @@ from src.service import SolverService
 
 
 class SolverScaffoldTests(unittest.TestCase):
+    def test_default_browser_tree_rss_budget_is_conservative(self):
+        self.assertEqual(SolverConfig().browser_max_rss_mb, 2048)
+
     def test_normalize_proxy_host_port_user_pass(self):
         self.assertEqual(
             normalize_proxy("1.2.3.4:8080:user:pass"),

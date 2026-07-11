@@ -14,6 +14,8 @@ the verification boundary explicit instead of silently falling back to Chrome.
 from __future__ import annotations
 
 import argparse
+import ast
+import asyncio
 import fcntl
 import html as html_lib
 import json
@@ -24,6 +26,7 @@ import secrets
 import string
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -33,6 +36,17 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 from curl_cffi import requests
+
+from turnstile_broker import (
+    FingerprintProfile,
+    SolveRequest,
+    SolveResult,
+    TokenLease,
+    TokenLeaseError,
+    TurnstileBroker,
+    build_canonical_fingerprint_profile,
+    get_shared_broker,
+)
 
 from xai_oauth import (
     XAI_REDIRECT_HOST,
@@ -53,10 +67,10 @@ SIGNUP_URL = f"{ACCOUNT_ORIGIN}/sign-up?redirect=grok-com"
 SIGNIN_URL = f"{ACCOUNT_ORIGIN}/sign-in"
 API_RPC_URL = f"{ACCOUNT_ORIGIN}/api/rpc"
 DEFAULT_TIMEOUT = 30
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-)
+DEFAULT_FINGERPRINT = build_canonical_fingerprint_profile()
+DEFAULT_ACCEPT_LANGUAGE = DEFAULT_FINGERPRINT.accept_language
+CHROME136_SEC_CH_UA = DEFAULT_FINGERPRINT.sec_ch_ua
+DEFAULT_USER_AGENT = DEFAULT_FINGERPRINT.user_agent
 
 # These are fallbacks only.  The client obtains the current action IDs from the
 # loaded scripts first, because a Next deployment can rotate them at any time.
@@ -114,15 +128,256 @@ def mask_email(email: str) -> str:
     return f"{local}@{domain}"
 
 
-def _safe_error_text(value: Any, limit: int = 360) -> str:
-    """Keep server diagnostics useful without leaking opaque credentials."""
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
-    text = re.sub(
-        r"(?i)(token|cookie|password|authorization|clientkey|api[_-]?key)([=:]\s*)[^,}\s]+",
-        r"\1\2<redacted>",
+_ERROR_SAFE_FIELD_SUFFIXES = (
+    "_count",
+    "_enabled",
+    "_length",
+    "_len",
+    "_name",
+    "_present",
+    "_status",
+    "_type",
+)
+_ERROR_SENSITIVE_KEYS = {
+    "access_token",
+    "apikey",
+    "api_key",
+    "authorization",
+    "bearer",
+    "clientkey",
+    "client_key",
+    "client_secret",
+    "cookie",
+    "cookies",
+    "cookie_jar",
+    "credential",
+    "credentials",
+    "id_token",
+    "password",
+    "passwd",
+    "proxy_authorization",
+    "pwd",
+    "refresh_token",
+    "secret",
+    "session_token",
+    "set_cookie",
+    "sso",
+    "sso_rw",
+    "token",
+}
+_ERROR_AUTHENTICATED_URL_RE = re.compile(
+    r"(?i)\b(?P<scheme>https?|socks4|socks5h?)://"
+    r"[^@\s/'\"<>]+@"
+    r"(?P<host>\[[^\]\s]+\]|[^:/\s,'\"<>]+)"
+    r"(?::(?P<port>\d+))?"
+)
+_ERROR_AUTH_SCHEME_RE = re.compile(
+    r"(?i)\b(?P<scheme>bearer|basic)\s+(?P<value>[A-Za-z0-9._~+/=-]{8,})"
+)
+_ERROR_QUOTED_PAIR_RE = re.compile(
+    r"(?P<key_quote>['\"])(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)"
+    r"(?P=key_quote)(?P<separator>\s*:\s*)"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^,\s}\]]+)"
+)
+_ERROR_KEY_VALUE_RE = re.compile(
+    r"(?i)\b(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)"
+    r"(?P<separator>\s*[=:]\s*)"
+    r"(?P<value>(?:(?i:bearer|basic)\s+"
+    r"(?:<redacted>|[A-Za-z0-9._~+/=-]{8,}))|"
+    r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)"
+)
+
+
+def _normalized_error_key(key: Any) -> str:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key or ""))
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def _is_sensitive_error_key(key: Any) -> bool:
+    normalized = _normalized_error_key(key)
+    if not normalized or normalized.endswith(_ERROR_SAFE_FIELD_SUFFIXES):
+        return False
+    compact = normalized.replace("_", "")
+    if normalized in _ERROR_SENSITIVE_KEYS or compact in {
+        item.replace("_", "") for item in _ERROR_SENSITIVE_KEYS
+    }:
+        return True
+    if normalized.endswith("_token"):
+        return True
+    if any(
+        marker in normalized
+        for marker in ("authorization", "cookie", "credential", "password", "passwd", "secret")
+    ):
+        return True
+    if "proxy" in normalized and any(
+        marker in compact
+        for marker in (
+            "auth",
+            "credential",
+            "login",
+            "password",
+            "passwd",
+            "pwd",
+            "user",
+            "username",
+        )
+    ):
+        return True
+    return False
+
+
+def _is_proxy_error_key(key: Any) -> bool:
+    return "proxy" in _normalized_error_key(key)
+
+
+def _strip_error_url_userinfo(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        scheme = str(match.group("scheme") or "").lower()
+        host = str(match.group("host") or "")
+        port = str(match.group("port") or "")
+        return f"{scheme}://{host}{f':{port}' if port else ''}"
+
+    return _ERROR_AUTHENTICATED_URL_RE.sub(replace, str(text or ""))
+
+
+def _is_authorization_error_key(key: Any) -> bool:
+    return _normalized_error_key(key) in {"authorization", "proxy_authorization"}
+
+
+def _redacted_pair_value(raw_value: str, key: Any = "") -> str:
+    value = str(raw_value or "")
+    quote_char = ""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        quote_char = value[0]
+        value = value[1:-1]
+    if _is_authorization_error_key(key):
+        auth_match = re.match(r"(?i)^\s*(bearer|basic)\s+", value)
+        if auth_match:
+            redacted = f"{auth_match.group(1)} <redacted>"
+            return f"{quote_char}{redacted}{quote_char}" if quote_char else redacted
+    if quote_char:
+        return f"{quote_char}<redacted>{quote_char}"
+    return "<redacted>"
+
+
+def _sanitize_proxy_field_value(raw_value: str) -> str:
+    value = str(raw_value or "")
+    quote_char = ""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        quote_char = value[0]
+        value = value[1:-1]
+    value = _strip_error_url_userinfo(value)
+    if "://" not in value:
+        legacy = re.fullmatch(r"([^:\s]+):(\d+):[^:\s]+:.+", value)
+        if legacy:
+            value = f"{legacy.group(1)}:{legacy.group(2)}"
+    return f"{quote_char}{value}{quote_char}" if quote_char else value
+
+
+def _sanitize_error_string(value: str) -> str:
+    text = str(value or "")
+    stripped = text.strip()
+    if stripped and stripped[:1] in "{[(" and stripped[-1:] in "}])":
+        parsed: Any = None
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                candidate = parser(stripped)
+            except (TypeError, ValueError, SyntaxError):
+                continue
+            if isinstance(candidate, (dict, list, tuple)):
+                parsed = candidate
+                break
+        if parsed is not None:
+            return json.dumps(
+                _clean_error_value(parsed),
+                ensure_ascii=False,
+                separators=(", ", ": "),
+            )
+
+    text = _strip_error_url_userinfo(text)
+    text = _ERROR_AUTH_SCHEME_RE.sub(
+        lambda match: f"{match.group('scheme')} <redacted>",
         text,
     )
-    return text[:limit]
+
+    def replace_pair(match: re.Match[str]) -> str:
+        key = match.group("key")
+        value_text = match.group("value")
+        if _is_sensitive_error_key(key):
+            value_text = _redacted_pair_value(value_text, key)
+        elif _is_proxy_error_key(key):
+            value_text = _sanitize_proxy_field_value(value_text)
+        return (
+            f"{match.groupdict().get('key_quote') or ''}{key}"
+            f"{match.groupdict().get('key_quote') or ''}"
+            f"{match.group('separator')}{value_text}"
+        )
+
+    text = _ERROR_QUOTED_PAIR_RE.sub(replace_pair, text)
+
+    def replace_key_value(match: re.Match[str]) -> str:
+        key = match.group("key")
+        value_text = match.group("value")
+        if _is_sensitive_error_key(key):
+            value_text = _redacted_pair_value(value_text, key)
+        elif _is_proxy_error_key(key):
+            value_text = _sanitize_proxy_field_value(value_text)
+        return f"{key}{match.group('separator')}{value_text}"
+
+    return _ERROR_KEY_VALUE_RE.sub(replace_key_value, text)
+
+
+def _clean_error_value(
+    value: Any,
+    *,
+    key_hint: Any = "",
+    seen: Optional[set[int]] = None,
+) -> Any:
+    if _is_sensitive_error_key(key_hint):
+        if isinstance(value, str):
+            return _redacted_pair_value(value, key_hint)
+        return "<redacted>"
+    seen = seen if seen is not None else set()
+    if isinstance(value, dict):
+        identity = id(value)
+        if identity in seen:
+            return "<recursive>"
+        seen.add(identity)
+        try:
+            return {
+                key: _clean_error_value(item, key_hint=key, seen=seen)
+                for key, item in value.items()
+            }
+        finally:
+            seen.discard(identity)
+    if isinstance(value, (list, tuple)):
+        identity = id(value)
+        if identity in seen:
+            return "<recursive>"
+        seen.add(identity)
+        try:
+            cleaned = [
+                _clean_error_value(item, key_hint=key_hint, seen=seen)
+                for item in value
+            ]
+            return tuple(cleaned) if isinstance(value, tuple) else cleaned
+        finally:
+            seen.discard(identity)
+    if isinstance(value, str):
+        text = _sanitize_error_string(value)
+        return _sanitize_proxy_field_value(text) if _is_proxy_error_key(key_hint) else text
+    return value
+
+
+def _safe_error_text(value: Any, limit: int = 360) -> str:
+    """Keep server diagnostics useful without leaking opaque credentials."""
+    cleaned = _clean_error_value(value)
+    if isinstance(cleaned, (dict, list, tuple)):
+        text = json.dumps(cleaned, ensure_ascii=False, separators=(", ", ": "))
+    else:
+        text = str(cleaned or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[: max(0, int(limit))]
 
 
 def normalize_proxy(raw: str) -> str:
@@ -633,7 +888,13 @@ def _solve_turnstile_local(
     sitekey: str = "",
     action: str = "",
     cdata: str = "",
-) -> str:
+    user_agent: str = "",
+    accept_language: str = DEFAULT_ACCEPT_LANGUAGE,
+    expected_platform: str = "",
+    expected_client_hint_platform: str = "",
+    expected_browser_major: str = "",
+    return_result: bool = False,
+) -> Any:
     """Capture a real Turnstile token with local Chrome/DrissionPage.
 
     Drop-in alternative to third-party captcha APIs for low-concurrency research.
@@ -641,7 +902,7 @@ def _solve_turnstile_local(
     official Turnstile widget on accounts.x.ai instead of clicking through the
     multi-step signup UI (email OTP page has no widget).
     """
-    token = capture_turnstile_token(
+    captured = capture_turnstile_token(
         proxy=proxy,
         output="",
         proxy_used_file="",
@@ -653,16 +914,22 @@ def _solve_turnstile_local(
         sitekey=sitekey,
         action=action,
         cdata=cdata,
+        user_agent=user_agent,
+        accept_language=accept_language,
+        expected_platform=expected_platform,
+        expected_client_hint_platform=expected_client_hint_platform,
+        expected_browser_major=expected_browser_major,
+        return_result=return_result,
         # With an explicit sitekey, stay on the origin and render the widget.
         # Do not drive the email-registration UI.
         click_email_signup=not bool(str(sitekey or "").strip()),
     )
-    token = str(token or "").strip()
+    token = str(captured.token if isinstance(captured, SolveResult) else captured or "").strip()
     if len(token) < 80:
         raise VerificationRequiredError(
             f"local browser Turnstile token 无效 (len={len(token)})"
         )
-    return token
+    return captured if return_result and isinstance(captured, SolveResult) else token
 
 
 def _solve_turnstile_capsolver(
@@ -894,6 +1161,405 @@ def _solve_turnstile_yescaptcha(
     raise VerificationRequiredError(f"yescaptcha 求解超时 ({timeout}s)")
 
 
+def _validate_local_fingerprint(
+    *,
+    expected_user_agent: str,
+    observed_user_agent: str,
+    expected_language: str,
+    observed_language: str,
+    expected_platform: str = "",
+    observed_platform: str = "",
+    expected_client_hint_platform: str = "",
+    observed_client_hint_platform: str = "",
+    expected_browser_major: str = "",
+    observed_browser_major: str = "",
+) -> None:
+    expected_user_agent = str(expected_user_agent or "").strip()
+    observed_user_agent = str(observed_user_agent or "").strip()
+    if expected_user_agent and observed_user_agent != expected_user_agent:
+        raise VerificationRequiredError(
+            "local Turnstile 浏览器 UA 与 HTTP 会话指纹不一致"
+        )
+    expected_primary = str(expected_language or "").split(",", 1)[0].split(";", 1)[0].strip().lower()
+    observed_primary = str(observed_language or "").strip().lower()
+    if expected_primary and observed_primary != expected_primary:
+        raise VerificationRequiredError(
+            "local Turnstile 浏览器语言与 HTTP 会话指纹不一致"
+        )
+    if str(expected_platform or "").strip() and str(observed_platform or "").strip() != str(expected_platform).strip():
+        raise VerificationRequiredError(
+            "local Turnstile navigator.platform 与 HTTP 会话指纹不一致"
+        )
+    if (
+        str(expected_client_hint_platform or "").strip()
+        and str(observed_client_hint_platform or "").strip()
+        != str(expected_client_hint_platform).strip()
+    ):
+        raise VerificationRequiredError(
+            "local Turnstile Client Hint platform 与 HTTP 会话指纹不一致"
+        )
+    if (
+        str(expected_browser_major or "").strip()
+        and str(observed_browser_major or "").strip()
+        != str(expected_browser_major).strip()
+    ):
+        raise VerificationRequiredError(
+            "local Turnstile 浏览器主版本与 HTTP 会话指纹不一致"
+        )
+
+
+async def _solve_request_async(request: SolveRequest, _sleep: Callable[[float], Any]) -> SolveResult:
+    """Run legacy provider adapters off-loop while retaining one broker boundary."""
+    started = time.monotonic()
+    fingerprint = request.fingerprint or DEFAULT_FINGERPRINT
+
+    if request.broker_url:
+        endpoint = request.broker_url.rstrip("/") + "/v1/solve"
+        payload = {
+            "provider": request.provider,
+            "api_key": request.api_key,
+            "sitekey": request.sitekey,
+            "page_url": request.page_url,
+            "proxy": request.proxy,
+            "action": request.action,
+            "cdata": request.cdata,
+            "timeout_sec": request.timeout_sec,
+            "headless": request.headless,
+            "user_agent": fingerprint.user_agent,
+            "accept_language": fingerprint.accept_language,
+            "expected_platform": fingerprint.navigator_platform,
+            "expected_client_hint_platform": fingerprint.client_hint_platform,
+            "expected_browser_major": fingerprint.browser_major,
+            "metadata": {"action": request.action, "cdata": request.cdata},
+        }
+        response = await asyncio.to_thread(
+            requests.post,
+            endpoint,
+            json=payload,
+            timeout=max(5, request.timeout_sec + 5),
+            impersonate=fingerprint.impersonate,
+        )
+        data = _response_json(response)
+        if not data.get("ok", True):
+            raise VerificationRequiredError(
+                f"Turnstile broker 求解失败: {_safe_error_text(data.get('error') or data)}"
+            )
+        token = str(data.get("token") or "").strip()
+        observed_user_agent = str(data.get("user_agent") or "").strip()
+        fingerprint_data = data.get("fingerprint") if isinstance(data.get("fingerprint"), dict) else {}
+        response_extras = data.get("extras") if isinstance(data.get("extras"), dict) else {}
+        observed_language = str(
+            fingerprint_data.get("navigator_language")
+            or response_extras.get("language")
+            or ""
+        ).strip()
+        user_agent_data = (
+            fingerprint_data.get("user_agent_data")
+            if isinstance(fingerprint_data.get("user_agent_data"), dict)
+            else {}
+        )
+        observed_platform = str(fingerprint_data.get("platform") or "").strip()
+        observed_client_hint_platform = str(
+            fingerprint_data.get("client_hint_platform")
+            or user_agent_data.get("platform")
+            or ""
+        ).strip()
+        observed_browser_major = str(
+            fingerprint_data.get("browser_major") or ""
+        ).strip()
+        if request.provider == "local":
+            _validate_local_fingerprint(
+                expected_user_agent=fingerprint.user_agent,
+                observed_user_agent=observed_user_agent,
+                expected_language=fingerprint.accept_language,
+                observed_language=observed_language,
+                expected_platform=fingerprint.navigator_platform,
+                observed_platform=observed_platform,
+                expected_client_hint_platform=fingerprint.client_hint_platform,
+                observed_client_hint_platform=observed_client_hint_platform,
+                expected_browser_major=fingerprint.browser_major,
+                observed_browser_major=observed_browser_major,
+            )
+        extras = dict(response_extras)
+        if fingerprint_data:
+            extras["fingerprint"] = dict(fingerprint_data)
+        if observed_language:
+            extras["language"] = observed_language
+        remote_lease = data.get("lease") if isinstance(data.get("lease"), dict) else {}
+        if remote_lease.get("lease_id"):
+            extras.update(
+                {
+                    "broker_url": request.broker_url.rstrip("/"),
+                    "lease_id": str(remote_lease.get("lease_id") or ""),
+                    "issued_at_ms": remote_lease.get("issued_at_ms"),
+                    "expires_at_ms": remote_lease.get("expires_at_ms"),
+                    "affinity_id": remote_lease.get("affinity_id"),
+                }
+            )
+        raw_token_length = (
+            remote_lease.get("token_length")
+            or response_extras.get("token_length")
+            or response_extras.get("token_len")
+            or len(token)
+        )
+        try:
+            extras["token_length"] = max(0, int(raw_token_length or 0))
+        except (TypeError, ValueError):
+            extras["token_length"] = len(token)
+        return SolveResult(
+            token=token,
+            provider=request.provider,
+            received_at=time.monotonic(),
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            user_agent=observed_user_agent,
+            user_agent_authoritative=request.provider == "local",
+            proxy=request.proxy,
+            action=request.action,
+            cdata=request.cdata,
+            extras=extras,
+        )
+
+    if request.provider == "local":
+        captured = await asyncio.to_thread(
+            _solve_turnstile_local,
+            page_url=request.page_url,
+            proxy=request.proxy,
+            timeout=request.timeout_sec,
+            headless=request.headless,
+            log_callback=None,
+            sitekey=request.sitekey,
+            action=request.action,
+            cdata=request.cdata,
+            user_agent=fingerprint.user_agent,
+            accept_language=fingerprint.accept_language,
+            expected_platform=fingerprint.navigator_platform,
+            expected_client_hint_platform=fingerprint.client_hint_platform,
+            expected_browser_major=fingerprint.browser_major,
+            return_result=True,
+        )
+        if isinstance(captured, SolveResult):
+            return captured
+        token = str(captured or "").strip()
+    else:
+        token = await asyncio.to_thread(
+            solve_turnstile_token,
+            sitekey=request.sitekey,
+            page_url=request.page_url,
+            provider=request.provider,
+            api_key=request.api_key,
+            proxy=request.proxy,
+            action=request.action,
+            cdata=request.cdata,
+            timeout=request.timeout_sec,
+            headless=request.headless,
+        )
+    return SolveResult(
+        token=token,
+        provider=request.provider,
+        received_at=time.monotonic(),
+        elapsed_ms=int((time.monotonic() - started) * 1000),
+        user_agent="",
+        user_agent_authoritative=False,
+        proxy=request.proxy,
+        action=request.action,
+        cdata=request.cdata,
+    )
+
+
+def solve_turnstile_result(
+    *,
+    sitekey: str,
+    page_url: str = SIGNUP_URL,
+    provider: str = "",
+    api_key: str = "",
+    proxy: str = "",
+    action: str = "",
+    cdata: str = "",
+    timeout: int = 180,
+    headless: bool = False,
+    fingerprint: Optional[FingerprintProfile] = None,
+    broker: Optional[TurnstileBroker] = None,
+    broker_url: str = "",
+    workers: int = 0,
+    queue_size: int = 64,
+) -> SolveResult:
+    normalized_provider = _normalize_turnstile_provider(provider) or _default_turnstile_provider()
+    resolved_key = _turnstile_api_key(normalized_provider, api_key)
+    request = SolveRequest(
+        provider=normalized_provider,
+        sitekey=str(sitekey or "").strip(),
+        page_url=str(page_url or SIGNUP_URL).strip() or SIGNUP_URL,
+        api_key=resolved_key,
+        proxy=str(proxy or "").strip(),
+        action=str(action or "").strip(),
+        cdata=str(cdata or "").strip(),
+        timeout_sec=max(30, int(timeout or 180)),
+        headless=bool(headless),
+        fingerprint=fingerprint or DEFAULT_FINGERPRINT,
+        broker_url=str(broker_url or "").strip(),
+    )
+    if normalized_provider != "local" and not request.api_key and not request.broker_url:
+        raise VerificationRequiredError("Turnstile 求解缺少 API key")
+    selected_workers = max(1, int(workers or (3 if normalized_provider == "local" else 16)))
+    selected_broker = broker or get_shared_broker(
+        provider=normalized_provider,
+        workers=selected_workers,
+        queue_limit=max(1, int(queue_size or 64)),
+    )
+    result = selected_broker.solve_sync(request, _solve_request_async)
+    token_length = len(str(result.token or "").strip())
+    result_extras = result.extras if isinstance(result.extras, dict) else {}
+    lease_id = str(result_extras.get("lease_id") or "").strip()
+    try:
+        reported_token_length = int(
+            result_extras.get("token_length") or result_extras.get("token_len") or 0
+        )
+    except (TypeError, ValueError):
+        reported_token_length = 0
+    if token_length < 80 and not (lease_id and reported_token_length >= 80):
+        raise VerificationRequiredError(
+            f"{normalized_provider} 返回的 Turnstile token 无效 "
+            f"(len={token_length}, reported_len={reported_token_length})"
+        )
+    return result
+
+
+def _consume_remote_turnstile_lease(
+    result: SolveResult,
+    *,
+    fingerprint: FingerprintProfile,
+) -> str:
+    extras = result.extras if isinstance(result.extras, dict) else {}
+    broker_url = str(extras.get("broker_url") or "").rstrip("/")
+    lease_id = str(extras.get("lease_id") or "").strip()
+    if not broker_url or not lease_id:
+        return str(result.token or "").strip()
+    try:
+        response = requests.post(
+            f"{broker_url}/v1/leases/{quote(lease_id, safe='')}/consume",
+            timeout=15,
+            impersonate=fingerprint.impersonate,
+        )
+    except Exception as exc:
+        raise VerificationRequiredError(
+            f"Turnstile broker lease consume 请求失败: {_safe_error_text(exc)}"
+        ) from exc
+    status = int(getattr(response, "status_code", 0) or 0)
+    data = _response_json(response)
+    if status == 409:
+        raise VerificationRequiredError("Turnstile broker lease 已重复消费、过期或不存在")
+    if not 200 <= status < 300:
+        raise VerificationRequiredError(
+            f"Turnstile broker lease consume HTTP {status}: {_safe_error_text(data or getattr(response, 'text', ''))}"
+        )
+    token = str(data.get("token") or "").strip()
+    if len(token) < 80:
+        raise VerificationRequiredError("Turnstile broker lease consume 未返回有效 token")
+    if result.token and token != str(result.token).strip():
+        raise VerificationRequiredError("Turnstile broker lease token 与求解结果不一致")
+    return token
+
+
+def _acquire_remote_submit_permit(
+    broker_url: str,
+    *,
+    timeout_sec: int,
+    lease_sec: int,
+    fingerprint: FingerprintProfile,
+) -> str:
+    try:
+        response = requests.post(
+            broker_url.rstrip("/") + "/v1/permits/submit/acquire",
+            json={
+                "timeout_sec": max(1, int(timeout_sec or 30)),
+                "lease_sec": max(1, int(lease_sec or 60)),
+            },
+            timeout=max(5, int(timeout_sec or 30) + 5),
+            impersonate=fingerprint.impersonate,
+        )
+    except Exception as exc:
+        raise XAIHttpFlowError(
+            f"Turnstile broker submit permit 获取失败: {_safe_error_text(exc)}"
+        ) from exc
+    status = int(getattr(response, "status_code", 0) or 0)
+    data = _response_json(response)
+    if not 200 <= status < 300:
+        raise XAIHttpFlowError(
+            f"Turnstile broker submit permit HTTP {status}: {_safe_error_text(data or getattr(response, 'text', ''))}"
+        )
+    permit_id = str(data.get("permit_id") or "").strip()
+    if not permit_id:
+        raise XAIHttpFlowError("Turnstile broker submit permit 响应缺少 permit_id")
+    return permit_id
+
+
+def _release_remote_submit_permit(
+    broker_url: str,
+    permit_id: str,
+    *,
+    fingerprint: FingerprintProfile,
+) -> None:
+    response = requests.post(
+        broker_url.rstrip("/")
+        + f"/v1/permits/submit/{quote(str(permit_id or ''), safe='')}/release",
+        timeout=15,
+        impersonate=fingerprint.impersonate,
+    )
+    status = int(getattr(response, "status_code", 0) or 0)
+    if not 200 <= status < 300:
+        raise XAIHttpFlowError(
+            f"Turnstile broker submit permit release HTTP {status}"
+        )
+
+
+_LOCAL_SUBMIT_SEMAPHORES: Dict[int, threading.BoundedSemaphore] = {}
+_LOCAL_SUBMIT_SEMAPHORES_LOCK = threading.Lock()
+
+
+@contextmanager
+def _submit_permit(
+    *,
+    broker_url: str,
+    submit_workers: int,
+    timeout_sec: int,
+    fingerprint: FingerprintProfile,
+    log_callback: LogFn = None,
+):
+    permit_id = ""
+    local_semaphore: Optional[threading.BoundedSemaphore] = None
+    if broker_url:
+        lease_sec = max(60, min(300, int(timeout_sec or 60)))
+        permit_id = _acquire_remote_submit_permit(
+            broker_url,
+            timeout_sec=timeout_sec,
+            lease_sec=lease_sec,
+            fingerprint=fingerprint,
+        )
+    else:
+        limit = max(1, int(submit_workers or 1))
+        with _LOCAL_SUBMIT_SEMAPHORES_LOCK:
+            local_semaphore = _LOCAL_SUBMIT_SEMAPHORES.get(limit)
+            if local_semaphore is None:
+                local_semaphore = threading.BoundedSemaphore(limit)
+                _LOCAL_SUBMIT_SEMAPHORES[limit] = local_semaphore
+        if not local_semaphore.acquire(timeout=max(1, int(timeout_sec or 30))):
+            raise XAIHttpFlowError("等待注册提交并发槽超时")
+    try:
+        yield permit_id
+    finally:
+        if permit_id:
+            try:
+                _release_remote_submit_permit(
+                    broker_url,
+                    permit_id,
+                    fingerprint=fingerprint,
+                )
+            except Exception as exc:
+                _log(log_callback, f"[HTTP][warn] submit permit release 失败: {_safe_error_text(exc)}")
+        elif local_semaphore is not None:
+            local_semaphore.release()
+
+
 class BrowserlessXAIClient:
     """Stateful xAI HTTP client with a real cross-domain cookie jar."""
 
@@ -903,21 +1569,38 @@ class BrowserlessXAIClient:
         proxy: str = "",
         timeout: int = DEFAULT_TIMEOUT,
         user_agent: str = DEFAULT_USER_AGENT,
+        fingerprint: Optional[FingerprintProfile] = None,
         session: Any = None,
         log_callback: LogFn = None,
     ):
         self.proxy = normalize_proxy(proxy)
         self.proxies = _proxy_dict(self.proxy)
         self.timeout = max(5, int(timeout or DEFAULT_TIMEOUT))
-        self.user_agent = str(user_agent or DEFAULT_USER_AGENT)
+        if fingerprint is None:
+            selected_user_agent = str(user_agent or DEFAULT_USER_AGENT)
+            fingerprint = FingerprintProfile(
+                profile_id=DEFAULT_FINGERPRINT.profile_id,
+                impersonate=DEFAULT_FINGERPRINT.impersonate,
+                user_agent=selected_user_agent,
+                accept_language=DEFAULT_FINGERPRINT.accept_language,
+                navigator_platform=DEFAULT_FINGERPRINT.navigator_platform,
+                client_hint_platform=DEFAULT_FINGERPRINT.client_hint_platform,
+                browser_major=DEFAULT_FINGERPRINT.browser_major,
+                sec_ch_ua=DEFAULT_FINGERPRINT.sec_ch_ua,
+            )
+        self.fingerprint = fingerprint
+        self.user_agent = fingerprint.user_agent
+        self.accept_language = fingerprint.accept_language
         self.log_callback = log_callback
-        self.session = session or requests.Session(impersonate="chrome136")
+        self.session = session or requests.Session(impersonate=fingerprint.impersonate)
         headers = getattr(self.session, "headers", None)
         if headers is not None:
             headers.update(
                 {
                     "user-agent": self.user_agent,
-                    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "accept-language": self.accept_language,
+                    "sec-ch-ua": fingerprint.sec_ch_ua,
+                    "sec-ch-ua-platform": f'"{fingerprint.client_hint_platform}"',
                 }
             )
         self.signup_page_url = ""
@@ -1003,7 +1686,39 @@ class BrowserlessXAIClient:
     @staticmethod
     def challenge_metadata(page_html: str) -> Dict[str, str]:
         text = html_lib.unescape(str(page_html or "").replace(r'\"', '"'))
-        sitekey = re.search(r'"sitekey"\s*:\s*"([^"\\]+)"', text)
+        explicit_sitekeys = [
+            html_lib.unescape(match.group(2)).strip()
+            for match in re.finditer(
+                r'\bdata-sitekey\s*=\s*([\'\"])(.*?)\1',
+                text,
+                flags=re.I | re.S,
+            )
+            if str(match.group(2) or "").strip()
+        ]
+        json_sitekey_matches = list(
+            re.finditer(
+                r'"sitekey"\s*:\s*"([^"\\]+)"',
+                text,
+                flags=re.I,
+            )
+        )
+        json_sitekeys = [
+            html_lib.unescape(match.group(1).replace(r"\/", "/")).strip()
+            for match in json_sitekey_matches
+            if str(match.group(1) or "").strip()
+        ]
+
+        # A rendered widget attribute is authoritative over serialized/script
+        # copies.  Within the selected source, however, conflicting values are
+        # unsafe: never silently pick the first candidate.
+        selected_candidates = explicit_sitekeys if explicit_sitekeys else json_sitekeys
+        unique_sitekeys: List[str] = []
+        for candidate in selected_candidates:
+            if candidate not in unique_sitekeys:
+                unique_sitekeys.append(candidate)
+        sitekey_conflict = len(unique_sitekeys) > 1
+        sitekey_value = unique_sitekeys[0] if len(unique_sitekeys) == 1 else ""
+        sitekey_anchor = json_sitekey_matches[0] if json_sitekey_matches else None
         turnstile_tag = re.search(
             r"<[^>]+(?:\bcf-turnstile\b|\bdata-sitekey\b)[^>]*>",
             text,
@@ -1021,10 +1736,10 @@ class BrowserlessXAIClient:
             return html_lib.unescape(match.group(2)).strip() if match else ""
 
         def _near_sitekey_json(name: str) -> str:
-            if not sitekey:
+            if not sitekey_anchor:
                 return ""
-            start = max(0, sitekey.start() - 260)
-            end = min(len(text), sitekey.end() + 520)
+            start = max(0, sitekey_anchor.start() - 260)
+            end = min(len(text), sitekey_anchor.end() + 520)
             match = re.search(
                 rf'"{re.escape(name)}"\s*:\s*"((?:\\.|[^"\\])*)"',
                 text[start:end],
@@ -1034,11 +1749,11 @@ class BrowserlessXAIClient:
                 return ""
             return html_lib.unescape(match.group(1).replace(r"\/", "/")).strip()
 
-        sitekey_value = sitekey.group(1) if sitekey else _tag_attribute("data-sitekey")
         castle_pk = re.search(r'"castlePk"\s*:\s*"([^"\\]+)"', text)
         enabled = re.search(r'"enableCastle"\s*:\s*(true|false)', text, flags=re.I)
         return {
             "turnstile_sitekey": sitekey_value,
+            "turnstile_sitekey_conflict": "true" if sitekey_conflict else "",
             "turnstile_action": _tag_attribute("data-action") or _near_sitekey_json("action"),
             "turnstile_cdata": _tag_attribute("data-cdata") or _near_sitekey_json("cdata"),
             "castle_pk": castle_pk.group(1) if castle_pk else "",
@@ -2381,6 +3096,10 @@ def run_registration(
     turnstile_solve_timeout: int = 180,
     turnstile_proxy: str = "",
     turnstile_headless: bool = False,
+    turnstile_broker_url: str = "",
+    turnstile_workers: int = 0,
+    turnstile_queue_size: int = 64,
+    submit_workers: int = 4,
     given_name: str = "",
     family_name: str = "",
     password: str = "",
@@ -2465,6 +3184,10 @@ def run_registration(
     # Browser flow always verifies the OTP via gRPC before the Server Action submit.
     email_code = client.verify_email_validation_code(email, email_code)
     turnstile_token = str(turnstile_token or "").strip()
+    solve_result: Optional[SolveResult] = None
+    effective_broker_url = str(
+        turnstile_broker_url or config.get("turnstile_broker_url") or ""
+    ).strip()
     if not turnstile_token:
         turnstile_metadata = metadata
         sitekey = str(turnstile_metadata.get("turnstile_sitekey") or "").strip()
@@ -2485,7 +3208,7 @@ def run_registration(
                 use_headless = raw_headless
             else:
                 use_headless = str(raw_headless or "").strip().lower() in {"1", "true", "yes", "on"}
-        turnstile_token = solve_turnstile_token(
+        solve_result = solve_turnstile_result(
             sitekey=sitekey,
             page_url=client.signup_page_url or SIGNUP_URL,
             provider=provider,
@@ -2495,17 +3218,50 @@ def run_registration(
             cdata=str(turnstile_metadata.get("turnstile_cdata") or ""),
             timeout=turnstile_solve_timeout,
             headless=use_headless,
-            log_callback=client.log_callback,
+            fingerprint=client.fingerprint,
+            broker_url=effective_broker_url,
+            workers=int(turnstile_workers or config.get("turnstile_workers") or 0),
+            queue_size=int(turnstile_queue_size or config.get("turnstile_queue_size") or 64),
         )
-    sso = client.submit_registration(
-        email=email,
-        email_validation_code=email_code,
-        given_name=given_name,
-        family_name=family_name,
-        password=password,
-        turnstile_token=turnstile_token,
-        castle_request_token=castle_register_token,
-    )
+    if solve_result is None:
+        solve_result = SolveResult(
+            token=turnstile_token,
+            provider="provided",
+            received_at=time.monotonic(),
+            elapsed_ms=0,
+            user_agent=client.user_agent,
+            user_agent_authoritative=False,
+            proxy=client.proxy,
+        )
+    lease = TokenLease(solve_result, ttl_sec=240.0)
+    with _submit_permit(
+        broker_url=effective_broker_url,
+        submit_workers=submit_workers,
+        timeout_sec=turnstile_solve_timeout,
+        fingerprint=client.fingerprint,
+        log_callback=client.log_callback,
+    ):
+        try:
+            turnstile_token = lease.consume()
+        except TokenLeaseError as exc:
+            raise VerificationRequiredError(str(exc)) from exc
+        turnstile_token = _consume_remote_turnstile_lease(
+            solve_result,
+            fingerprint=client.fingerprint,
+        )
+        _log(
+            client.log_callback,
+            f"[HTTP] Turnstile lease 已消费 | age_ms={int(lease.age() * 1000)}",
+        )
+        sso = client.submit_registration(
+            email=email,
+            email_validation_code=email_code,
+            given_name=given_name,
+            family_name=family_name,
+            password=password,
+            turnstile_token=turnstile_token,
+            castle_request_token=castle_register_token,
+        )
     credential_path = ""
     if output_dir:
         credential_path = client.obtain_oauth_credential(output_dir=output_dir, email_hint=email)
@@ -2564,6 +3320,10 @@ def _add_token_options(parser: argparse.ArgumentParser, *, registration: bool = 
         default=180,
         help="Turnstile 求解等待秒数（默认 180）",
     )
+    parser.add_argument("--turnstile-broker-url", default="", help="共享 Turnstile broker 地址")
+    parser.add_argument("--turnstile-workers", type=int, default=0, help="独立 Turnstile 并发槽")
+    parser.add_argument("--turnstile-queue-size", type=int, default=64, help="Turnstile broker 排队上限")
+    parser.add_argument("--submit-workers", type=int, default=4, help="注册提交并发槽")
     if registration:
         parser.add_argument("--castle-email-token", default="", help="发送邮箱验证码时的 fresh Castle token")
         parser.add_argument("--castle-email-token-file", default="")
@@ -3709,8 +4469,14 @@ def capture_turnstile_token(
     sitekey: str = "",
     action: str = "",
     cdata: str = "",
+    user_agent: str = "",
+    accept_language: str = DEFAULT_ACCEPT_LANGUAGE,
+    expected_platform: str = "",
+    expected_client_hint_platform: str = "",
+    expected_browser_major: str = "",
+    return_result: bool = False,
     log_callback: LogFn = None,
-) -> str:
+) -> Any:
     """Open accounts.x.ai/sign-up in Chrome and capture a native Turnstile token.
 
     This intentionally uses a real browser.  It does not solve, forge, or bypass
@@ -3751,13 +4517,21 @@ def capture_turnstile_token(
             "很可能被 x.ai 硬拦截",
         )
 
+    capture_started = time.monotonic()
     options = _build_turnstile_browser_options(
         options=ChromiumOptions(),
         proxy=proxy,
         headless=bool(use_headless),
-        user_agent="",
+        user_agent=user_agent,
         log_callback=log_callback,
     )
+    primary_language = str(accept_language or "").split(",", 1)[0].split(";", 1)[0].strip()
+    if primary_language:
+        try:
+            options.set_argument(f"--lang={primary_language}")
+            options.set_pref("intl.accept_languages", str(accept_language))
+        except Exception:
+            pass
 
     browser = None
     page = None
@@ -4080,6 +4854,58 @@ return true;
                 f"title={(diag_samples[-1] or {}).get('title') if diag_samples else ''})"
             )
 
+        observed_user_agent = ""
+        observed_language = ""
+        observed_platform = ""
+        observed_client_hint_platform = ""
+        observed_browser_major = ""
+        try:
+            observed = page.run_js(
+                """
+return (async () => {
+  const uaData = navigator.userAgentData || null;
+  let high = {};
+  try {
+    if (uaData && typeof uaData.getHighEntropyValues === 'function') {
+      high = await uaData.getHighEntropyValues(['fullVersionList', 'platformVersion']);
+    }
+  } catch (_) {}
+  return {
+    userAgent: String(navigator.userAgent || ''),
+    language: String(navigator.language || ''),
+    platform: String(navigator.platform || ''),
+    clientHintPlatform: String((uaData && uaData.platform) || ''),
+    brands: (uaData && uaData.brands) || [],
+    fullVersionList: high.fullVersionList || []
+  };
+})();
+                """
+            ) or {}
+            if isinstance(observed, dict):
+                observed_user_agent = str(observed.get("userAgent") or "").strip()
+                observed_language = str(observed.get("language") or "").strip()
+                observed_platform = str(observed.get("platform") or "").strip()
+                observed_client_hint_platform = str(
+                    observed.get("clientHintPlatform") or ""
+                ).strip()
+                version_match = re.search(r"Chrome/(\d+)", observed_user_agent)
+                observed_browser_major = version_match.group(1) if version_match else ""
+        except Exception:
+            observed = {}
+        if user_agent:
+            _validate_local_fingerprint(
+                expected_user_agent=user_agent,
+                observed_user_agent=observed_user_agent,
+                expected_language=accept_language,
+                observed_language=observed_language,
+                expected_platform=expected_platform,
+                observed_platform=observed_platform,
+                expected_client_hint_platform=expected_client_hint_platform,
+                observed_client_hint_platform=observed_client_hint_platform,
+                expected_browser_major=expected_browser_major,
+                observed_browser_major=observed_browser_major,
+            )
+
         if str(output or "").strip():
             out = Path(str(output).strip()).expanduser()
             out.write_text(token + "\n", encoding="utf-8")
@@ -4094,6 +4920,24 @@ return true;
         if proxy_used_file:
             proxy_out = Path(str(proxy_used_file)).expanduser()
             proxy_out.write_text((selected_proxy_raw or proxy or "") + "\n", encoding="utf-8")
+        if return_result:
+            return SolveResult(
+                token=token,
+                provider="local",
+                received_at=time.monotonic(),
+                elapsed_ms=int((time.monotonic() - capture_started) * 1000),
+                user_agent=observed_user_agent,
+                user_agent_authoritative=True,
+                proxy=proxy,
+                action=action,
+                cdata=cdata,
+                extras={
+                    "language": observed_language,
+                    "platform": observed_platform,
+                    "client_hint_platform": observed_client_hint_platform,
+                    "browser_major": observed_browser_major,
+                },
+            )
         return token
     finally:
         _quit_turnstile_browser(browser, options)
@@ -4227,6 +5071,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             turnstile_solve_timeout=int(getattr(args, "turnstile_solve_timeout", 0) or 180),
             turnstile_proxy=captcha_proxy,
             turnstile_headless=bool(getattr(args, "turnstile_headless", False)),
+            turnstile_broker_url=getattr(args, "turnstile_broker_url", "") or "",
+            turnstile_workers=int(getattr(args, "turnstile_workers", 0) or 0),
+            turnstile_queue_size=int(getattr(args, "turnstile_queue_size", 64) or 64),
+            submit_workers=int(getattr(args, "submit_workers", 4) or 4),
             given_name=args.given_name,
             family_name=args.family_name,
             password=args.password or os.environ.get("XAI_PASSWORD", ""),

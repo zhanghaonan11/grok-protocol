@@ -523,7 +523,8 @@ print('[HTTP] fake backend completed', flush=True)
                 config=tui._read_config(config_path),
             )
             plan = tui.build_plan(settings)
-            self.assertLessEqual(plan.workers, tui.MAX_LOCAL_TURNSTILE_WORKERS)
+            self.assertEqual(plan.workers, 10)
+            self.assertLessEqual(plan.turnstile_workers, tui.MAX_LOCAL_TURNSTILE_WORKERS)
             self.assertTrue(any("本地浏览器" in w and "并发" in w for w in plan.warnings))
 
 
