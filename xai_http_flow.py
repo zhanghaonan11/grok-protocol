@@ -4008,6 +4008,11 @@ def _add_token_options(parser: argparse.ArgumentParser, *, registration: bool = 
         default=1,
         help="Turnstile 求解失败重试次数（默认 1，含首次）",
     )
+    parser.add_argument(
+        "--turnstile-proxy",
+        default="",
+        help="Turnstile 求解专用代理（优先于注册出口代理；空=回退注册代理）",
+    )
     parser.add_argument("--turnstile-broker-url", default="", help="共享 Turnstile broker 地址")
     parser.add_argument("--turnstile-workers", type=int, default=0, help="独立 Turnstile 并发槽")
     parser.add_argument("--turnstile-queue-size", type=int, default=64, help="Turnstile broker 排队上限")
@@ -5715,9 +5720,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
 
         client = BrowserlessXAIClient(proxy=proxy, timeout=args.timeout, log_callback=logger)
-        # 2Captcha/YesCaptcha can use the real upstream rather than the local
-        # forwarder; CapSolver's documented Turnstile task ignores it as proxyless.
-        captcha_proxy = normalize_proxy(selected_raw) if selected_raw else proxy
+        # Prefer independent Turnstile proxy when provided; else reuse register upstream.
+        dedicated_ts = str(getattr(args, "turnstile_proxy", "") or "").strip()
+        if not dedicated_ts:
+            try:
+                from http_batch_service import pick_turnstile_proxy
+                dedicated_ts = pick_turnstile_proxy(config if isinstance(config, dict) else {})
+            except Exception:
+                dedicated_ts = ""
+        if dedicated_ts:
+            captcha_proxy = normalize_proxy(dedicated_ts) or dedicated_ts
+            logger("[HTTP] Turnstile 使用独立求解代理")
+        else:
+            captcha_proxy = normalize_proxy(selected_raw) if selected_raw else proxy
         if args.command == "credential":
             sso = _secret_from(args.sso, args.sso_file, "XAI_SSO")
             sso_rw = ""

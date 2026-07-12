@@ -83,6 +83,11 @@ function fill(data) {
   set("local_proxy_port", f.local_proxy_port || 17890);
   set("proxy_random", !!f.proxy_random, true);
   set("proxy_rotate_session", !!f.proxy_rotate_session, true);
+  set("turnstile_proxy_enabled", !!f.turnstile_proxy_enabled, true);
+  set("turnstile_proxy_mode", f.turnstile_proxy_mode || "pool");
+  set("turnstile_proxy", f.turnstile_proxy || "");
+  set("turnstile_proxy_file", f.turnstile_proxy_file || "turnstile_proxies.txt");
+  set("turnstile_proxy_random", f.turnstile_proxy_random !== false, true);
   set("xai_oauth_output_dir", f.xai_oauth_output_dir || "");
   set("grok2api_remote_base", f.grok2api_remote_base || "");
   set("grok2api_remote_app_key", f.grok2api_remote_app_key || "");
@@ -93,6 +98,11 @@ function fill(data) {
 
   const pool = data.proxy_pool || {};
   $("proxyPoolText").value = pool.text || "";
+  const tsPool = data.turnstile_proxy_pool || {};
+  if ($("turnstileProxyPoolText")) $("turnstileProxyPoolText").value = tsPool.text || "";
+  if ($("turnstilePoolMeta")) {
+    $("turnstilePoolMeta").textContent = `求解代理池: ${tsPool.line_count || 0} 条 | ${tsPool.path || "-"}`;
+  }
   $("poolMeta").textContent = `代理池文件: ${pool.path || "-"} | 有效行: ${pool.line_count || 0} | 存在: ${pool.exists ? "是" : "否"}`;
 }
 
@@ -136,6 +146,11 @@ function collectFields() {
     local_proxy_port: Number(g("local_proxy_port") || 17890),
     proxy_random: g("proxy_random", true),
     proxy_rotate_session: g("proxy_rotate_session", true),
+    turnstile_proxy_enabled: g("turnstile_proxy_enabled", true),
+    turnstile_proxy_mode: g("turnstile_proxy_mode"),
+    turnstile_proxy: g("turnstile_proxy"),
+    turnstile_proxy_file: g("turnstile_proxy_file"),
+    turnstile_proxy_random: g("turnstile_proxy_random", true),
     xai_oauth_output_dir: g("xai_oauth_output_dir"),
     grok2api_remote_base: g("grok2api_remote_base"),
     grok2api_remote_app_key: g("grok2api_remote_app_key"),
@@ -162,6 +177,7 @@ $("btnSaveCfg").onclick = async () => {
     const payload = {
       fields: collectFields(),
       proxy_pool_text: $("proxyPoolText").value,
+      turnstile_proxy_pool_text: ($("turnstileProxyPoolText") && $("turnstileProxyPoolText").value) || "",
     };
     const data = await api("/api/config-center", { method: "PUT", body: JSON.stringify(payload) });
     fill(data);
@@ -221,6 +237,7 @@ $("btnImportSub").onclick = async () => {
       body: JSON.stringify({
         fields: collectFields(),
         proxy_pool_text: $("proxyPoolText").value,
+      turnstile_proxy_pool_text: ($("turnstileProxyPoolText") && $("turnstileProxyPoolText").value) || "",
       }),
     });
     fill(saved);
@@ -270,6 +287,7 @@ $("btnImportSub").onclick = async () => {
     $("btnImportSub").disabled = false;
   }
 };
+
 
 
 loadAll().catch(e => setMsg(String(e.message || e), true));
@@ -395,6 +413,7 @@ if (btnEmbeddedStart) {
         body: JSON.stringify({
           fields: collectFields(),
           proxy_pool_text: $("proxyPoolText").value,
+          turnstile_proxy_pool_text: ($("turnstileProxyPoolText") && $("turnstileProxyPoolText").value) || "",
         }),
       });
       fill(saved);
@@ -486,5 +505,58 @@ function setupHelpTips() {
   });
 }
 
+
+
+
+if ($("btnSaveTurnstilePool")) {
+  $("btnSaveTurnstilePool").onclick = async () => {
+    try {
+      const data = await api("/api/turnstile-proxy-pool", {
+        method: "PUT",
+        body: JSON.stringify({ text: ($("turnstileProxyPoolText") && $("turnstileProxyPoolText").value) || "" }),
+      });
+      if ($("turnstilePoolMeta")) {
+        $("turnstilePoolMeta").textContent = `求解代理池: ${data.line_count || 0} 条 | ${data.path || "-"}`;
+      }
+      setMsg(`求解代理池已保存：${data.line_count || 0} 条`);
+    } catch (e) {
+      setMsg(String(e.message || e), true);
+    }
+  };
+}
+
+if ($("btnTestTurnstilePool")) {
+  $("btnTestTurnstilePool").onclick = async () => {
+    try {
+      if ($("turnstileProxyTestResult")) $("turnstileProxyTestResult").textContent = "测试中…";
+      const data = await api("/api/turnstile-proxy-pool/test", {
+        method: "POST",
+        body: JSON.stringify({
+          count: 5,
+          timeout: 12,
+          text: ($("turnstileProxyPoolText") && $("turnstileProxyPoolText").value) || "",
+        }),
+      });
+      const lines = [];
+      lines.push(`探测: ${data.probe_url || data.url || "-"} | 超时: ${data.timeout || "-"}s`);
+      lines.push(`来源: ${data.source || "-"}`);
+      lines.push(`池内可用: ${data.total || 0} | 本次测试: ${(data.results || []).length} | 成功: ${data.success || 0} | 失败: ${data.failed || 0}`);
+      lines.push("");
+      for (const item of (data.results || [])) {
+        const status = item.ok ? "OK" : "FAIL";
+        const latency = item.latency_ms != null ? `${item.latency_ms}ms` : "-";
+        const ip = item.ip || "-";
+        const err = item.error ? ` | ${item.error}` : "";
+        lines.push(`[${status}] #${item.index} ${item.display || item.proxy || "-"} | ${latency} | ip=${ip}${err}`);
+      }
+      if ($("turnstileProxyTestResult")) $("turnstileProxyTestResult").textContent = lines.join("\n");
+    } catch (e) {
+      if ($("turnstileProxyTestResult")) $("turnstileProxyTestResult").textContent = "测试失败: " + String(e.message || e);
+      setMsg(String(e.message || e), true);
+    }
+  };
+}
+
 setupHelpTips();
+
 

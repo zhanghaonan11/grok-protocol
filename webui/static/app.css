@@ -354,3 +354,20 @@ label.check .field-title {
 #workerTable, #embeddedProxyStatusRun, #failureBox {
   content-visibility: auto;
 }
+
+
+.proxy-resource-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.proxy-resource-grid .panel.nested {
+  margin: 0;
+  background: #121821;
+}
+.proxy-resource-grid .pool {
+  min-height: 180px;
+}
+@media (max-width: 960px) {
+  .proxy-resource-grid { grid-template-columns: 1fr; }
+}

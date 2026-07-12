@@ -1366,6 +1366,13 @@ class BatchRunner:
             command.extend(["--proxy", worker.proxy_local_http])
         else:
             command.extend(self.plan.proxy_args)
+        # Independent Turnstile solve proxy (optional).
+        try:
+            ts_proxy = pick_turnstile_proxy(cfg if isinstance(cfg, dict) else {})
+        except Exception:
+            ts_proxy = ""
+        if ts_proxy:
+            command.extend(["--turnstile-proxy", ts_proxy])
         return command
 
     def _append_worker_log(self, worker: WorkerState, message: str) -> None:
@@ -2669,6 +2676,94 @@ def write_proxy_pool_text(settings: Settings, text_value: str, *, sync_proxies_a
 
 
 
+
+def turnstile_proxy_file_path(settings: Settings) -> Path:
+    raw = str((settings.config or {}).get("turnstile_proxy_file") or "turnstile_proxies.txt").strip() or "turnstile_proxies.txt"
+    return _absolute_path(raw, settings.config_path.parent)
+
+
+def read_turnstile_proxy_pool_text(settings: Settings) -> Dict[str, object]:
+    path = turnstile_proxy_file_path(settings)
+    text_value = ""
+    exists = path.is_file()
+    if exists:
+        try:
+            text_value = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise TuiConfigError(f"读取求解代理池文件失败: {exc}") from exc
+    lines = [ln.strip() for ln in text_value.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    return {
+        "path": str(path),
+        "exists": exists,
+        "line_count": len(lines),
+        "text": text_value,
+    }
+
+
+def write_turnstile_proxy_pool_text(settings: Settings, text_value: str) -> Dict[str, object]:
+    path = turnstile_proxy_file_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = str(text_value or "")
+    if content and not content.endswith("\n"):
+        content += "\n"
+    try:
+        path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        raise TuiConfigError(f"写入求解代理池文件失败: {exc}") from exc
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    cfg = dict(settings.config or {})
+    cfg["turnstile_proxy_file"] = _config_path_value(path, settings.config_path.parent)
+    settings.config = cfg
+    persist_settings(settings)
+    return {
+        "path": str(path),
+        "exists": True,
+        "line_count": len(lines),
+        "text": content,
+    }
+
+
+def pick_turnstile_proxy(config: Dict[str, object]) -> str:
+    """Pick an independent Turnstile solve proxy if enabled; else empty."""
+    cfg = dict(config or {})
+    if not _as_bool(cfg.get("turnstile_proxy_enabled")):
+        return ""
+    mode = str(cfg.get("turnstile_proxy_mode") or "pool").strip().lower()
+    if mode not in {"pool", "direct"}:
+        mode = "pool"
+    if mode == "direct":
+        return str(cfg.get("turnstile_proxy") or "").strip()
+    # pool mode
+    file_raw = str(cfg.get("turnstile_proxy_file") or "turnstile_proxies.txt").strip() or "turnstile_proxies.txt"
+    # resolve relative to config.json when possible
+    try:
+        # best effort absolute against ROOT_DIR / config parent
+        path = Path(file_raw)
+        if not path.is_absolute():
+            path = (ROOT_DIR / path).resolve()
+    except Exception:
+        path = ROOT_DIR / "turnstile_proxies.txt"
+    lines: List[str] = []
+    if path.is_file():
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                s = str(line or "").strip()
+                if not s or s.startswith("#"):
+                    continue
+                if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+                    s = s[1:-1].strip()
+                if s:
+                    lines.append(s)
+        except OSError:
+            lines = []
+    if not lines:
+        # fallback to direct field if pool empty
+        return str(cfg.get("turnstile_proxy") or "").strip()
+    if _as_bool(cfg.get("turnstile_proxy_random", True)):
+        return random.choice(lines)
+    return lines[0]
+
+
 def _proxy_pool_lines_from_text(text_value: str) -> List[str]:
     lines: List[str] = []
     for line in str(text_value or "").splitlines():
@@ -2841,6 +2936,7 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
     }
     public = _settings_to_public_dict(settings)
     pool = read_proxy_pool_text(settings)
+    ts_pool = read_turnstile_proxy_pool_text(settings)
     # Do not dump full proxy text into config blob twice; keep top-level pool.
     return {
         **public,
@@ -2850,6 +2946,12 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
             "exists": pool["exists"],
             "line_count": pool["line_count"],
             "text": pool["text"],
+        },
+        "turnstile_proxy_pool": {
+            "path": ts_pool["path"],
+            "exists": ts_pool["exists"],
+            "line_count": ts_pool["line_count"],
+            "text": ts_pool["text"],
         },
         "fields": {
             "email_provider": str(raw.get("email_provider") or ""),
@@ -2930,6 +3032,11 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
             "proxy_parent": str(raw.get("proxy_parent") or ""),
             "proxy_random": _as_bool(raw.get("proxy_random")),
             "proxy_rotate_session": _as_bool(raw.get("proxy_rotate_session")),
+            "turnstile_proxy_enabled": _as_bool(raw.get("turnstile_proxy_enabled")),
+            "turnstile_proxy_mode": str(raw.get("turnstile_proxy_mode") or "pool") or "pool",
+            "turnstile_proxy": str(raw.get("turnstile_proxy") or ""),
+            "turnstile_proxy_file": str(raw.get("turnstile_proxy_file") or "turnstile_proxies.txt"),
+            "turnstile_proxy_random": _as_bool(raw.get("turnstile_proxy_random", True)),
             "local_proxy_port": int(raw.get("local_proxy_port") or 17890),
             "xai_oauth_output_dir": str(settings.output_dir),
             "grok2api_remote_base": str(raw.get("grok2api_remote_base") or ""),
@@ -3092,6 +3199,11 @@ class BatchService:
                 raise TuiConfigError("代理模式无效，可选: auto/none/direct/pool")
             self.settings.proxy_mode = mode
             self.settings.no_proxy = mode == "none"
+        if "turnstile_proxy_mode" in fields:
+            ts_mode = str(fields.get("turnstile_proxy_mode") or "pool").strip().lower()
+            if ts_mode not in {"pool", "direct"}:
+                raise TuiConfigError("求解代理模式无效，可选: pool/direct")
+            fields["turnstile_proxy_mode"] = ts_mode
         if "turnstile_provider" in fields:
             self.settings.turnstile_provider = _normalize_turnstile_provider(fields.get("turnstile_provider"))
         if "turnstile_headless" in fields:
@@ -3114,6 +3226,9 @@ class BatchService:
             "embedded_proxy_listen_host",
             "embedded_proxy_probe_host",
             "proxy_parent",
+            "turnstile_proxy",
+            "turnstile_proxy_file",
+            "turnstile_proxy_mode",
             "grok2api_remote_base",
             "grok2api_pool_name",
             "grok2api_local_token_file",
@@ -3132,6 +3247,8 @@ class BatchService:
             "enable_nsfw",
             "xai_oauth_auto",
             "embedded_proxy_enabled",
+            "turnstile_proxy_enabled",
+            "turnstile_proxy_random",
         ]
         for key in bool_keys:
             if key in fields:
@@ -3248,6 +3365,10 @@ class BatchService:
             write_proxy_pool_text(self.settings, str(data.get("proxy_pool_text") or ""), sync_proxies_array=True)
             self.settings.config = _read_config(self.settings.config_path)
             _load_runtime_fields(self.settings)
+        if "turnstile_proxy_pool_text" in data:
+            write_turnstile_proxy_pool_text(self.settings, str(data.get("turnstile_proxy_pool_text") or ""))
+            self.settings.config = _read_config(self.settings.config_path)
+            _load_runtime_fields(self.settings)
         return self.get_config_center()
 
     def list_credentials(self, *, page: int = 1, page_size: int = 1000) -> Dict[str, object]:
@@ -3283,6 +3404,28 @@ class BatchService:
         self.settings.config = _read_config(self.settings.config_path)
         _load_runtime_fields(self.settings)
         return result
+
+    def get_turnstile_proxy_pool(self) -> Dict[str, object]:
+        return read_turnstile_proxy_pool_text(self.settings)
+
+    def set_turnstile_proxy_pool(self, text_value: str) -> Dict[str, object]:
+        result = write_turnstile_proxy_pool_text(self.settings, text_value)
+        self.settings.config = _read_config(self.settings.config_path)
+        _load_runtime_fields(self.settings)
+        return result
+
+    def test_turnstile_proxy_pool(
+        self, *, count: int = 5, text_value: Optional[str] = None, timeout: float = 12.0
+    ) -> Dict[str, object]:
+        if text_value is None:
+            text_value = str(read_turnstile_proxy_pool_text(self.settings).get("text") or "")
+        return test_proxy_pool_sample(
+            self.settings,
+            count=count,
+            text_value=text_value,
+            timeout=timeout,
+        )
+
 
     def import_proxy_subscription(
         self,

@@ -33,6 +33,7 @@ _PROVIDERS: Dict[str, Dict[str, str]] = {
     "capsolver": {
         "base_url": "https://api.capsolver.com",
         "proxyless_task_type": "AntiTurnstileTaskProxyLess",
+        "proxy_task_type": "AntiTurnstileTask",
     },
     "2captcha": {
         "base_url": "https://api.2captcha.com",
@@ -66,7 +67,7 @@ def _is_local_proxy_host(host: str) -> bool:
 def _resolve_provider_proxy(proxy: str, provider: str) -> Tuple[Optional[ProxySpec], str]:
     """Return an externally reachable provider proxy without exposing it in errors."""
 
-    if provider == "capsolver" or not str(proxy or "").strip():
+    if not str(proxy or "").strip():
         return None, "proxyless"
     try:
         spec = parse_proxy(proxy)
@@ -84,6 +85,7 @@ def _resolve_provider_proxy(proxy: str, provider: str) -> Tuple[Optional[ProxySp
         return None, "proxyless_local_ignored"
 
     allowed_schemes = {
+        "capsolver": {"http", "https", "socks4", "socks5"},
         "2captcha": {"http", "https", "socks4", "socks5"},
         "yescaptcha": {"http", "https", "socks5"},
     }
@@ -141,9 +143,9 @@ def _build_task(request: BrokerSolveRequest, provider: str) -> Dict[str, Any]:
         "websiteURL": request.page_url,
         "websiteKey": request.sitekey,
     }
-    if provider_proxy is not None:
+    if provider_proxy is not None and spec.get("proxy_task_type"):
         task["type"] = spec["proxy_task_type"]
-        if provider == "2captcha":
+        if provider in {"2captcha", "capsolver"}:
             task.update(
                 {
                     "proxyType": (

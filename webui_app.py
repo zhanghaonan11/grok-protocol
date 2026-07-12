@@ -425,6 +425,41 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
             raise _err(exc, 400) from exc
 
 
+    @app.get("/api/turnstile-proxy-pool")
+    def turnstile_proxy_pool_get() -> Dict[str, Any]:
+        try:
+            return get_service().get_turnstile_proxy_pool()
+        except svc.TuiConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/api/turnstile-proxy-pool")
+    def turnstile_proxy_pool_put(payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            text_value = ""
+            if isinstance(payload, dict):
+                text_value = str(payload.get("text") if "text" in payload else payload.get("turnstile_proxy_pool_text") or "")
+            return get_service().set_turnstile_proxy_pool(text_value)
+        except svc.TuiConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/turnstile-proxy-pool/test")
+    def turnstile_proxy_pool_test(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        data = payload or {}
+        try:
+            count = int(data.get("count") or 5)
+            timeout = float(data.get("timeout") or 12)
+            text_value = data.get("text")
+            if text_value is None:
+                text_value = data.get("turnstile_proxy_pool_text")
+            return get_service().test_turnstile_proxy_pool(
+                count=count,
+                text_value=text_value,
+                timeout=timeout,
+            )
+        except svc.TuiConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
     @app.get("/api/embedded-proxy/status")
     def embedded_proxy_status(compact: bool = Query(False)) -> Dict[str, Any]:
         try:
