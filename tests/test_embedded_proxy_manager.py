@@ -168,3 +168,45 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(args[0], "/usr/bin/verge-mihomo")
             self.assertIn("-f", args)
             self.assertIn("-d", args)
+
+
+class CooldownReviveTests(unittest.TestCase):
+    def test_revive_cooled_nodes_makes_them_acquirable(self):
+        from embedded_proxy_manager import EmbeddedProxyManager, NodeSlot, EmbeddedProxyConfig
+        import time
+        mgr = EmbeddedProxyManager(EmbeddedProxyConfig())
+        node = NodeSlot(
+            id="n1",
+            name="n1",
+            server="x",
+            port=443,
+            protocol="vless",
+            local_http="http://127.0.0.1:28001",
+            healthy=False,
+            fail_count=2,
+            cooldown_until=time.time() - 1,
+        )
+        mgr._nodes = {"n1": node}
+        mgr._running = True
+        revived = mgr.revive_cooled_nodes()
+        self.assertEqual(revived, 1)
+        self.assertTrue(node.healthy)
+        got = mgr.acquire()
+        self.assertIsNotNone(got)
+        self.assertEqual(got.id, "n1")
+
+    def test_status_revives_before_counting_healthy(self):
+        from embedded_proxy_manager import EmbeddedProxyManager, NodeSlot, EmbeddedProxyConfig
+        import time
+        mgr = EmbeddedProxyManager(EmbeddedProxyConfig())
+        mgr._nodes = {
+            "n1": NodeSlot(
+                id="n1", name="n1", server="x", port=443, protocol="vless",
+                local_http="http://127.0.0.1:28001", healthy=False,
+                cooldown_until=time.time() - 5,
+            )
+        }
+        mgr._running = True
+        st = mgr.status()
+        self.assertEqual(st["healthy"], 1)
+

@@ -1655,6 +1655,14 @@ class BatchRunner:
         ):
             return
         self._last_proxy_health_check_at = now
+        manager = self.embedded_proxy_manager
+        if manager is not None and hasattr(manager, "revive_cooled_nodes"):
+            try:
+                revived = int(manager.revive_cooled_nodes() or 0)
+                if revived > 0:
+                    self._log("SYSTEM", f"内嵌代理冷却结束，恢复 {revived} 个节点可调度")
+            except Exception:
+                pass
         snap = self._proxy_health_snapshot()
         if not snap.get("ready"):
             if snap.get("error"):
@@ -3645,16 +3653,22 @@ class BatchService:
         status.setdefault("leases", int(status.get("leases") or 0))
         last = dict(self._embedded_proxy_last or {})
         status.setdefault("last_error", last.get("last_error") or "")
-        # Prefer freshest healthy counts from last ensure/probe when manager status is sparse.
-        if last.get("healthy") is not None:
-            try:
-                if status.get("healthy") is None or int(status.get("healthy") or 0) == 0:
-                    if int(last.get("healthy") or 0) > 0:
-                        status["healthy"] = last.get("healthy")
-            except Exception:
-                status["healthy"] = last.get("healthy")
+        # Manager status is authoritative while running. Do NOT keep a stale
+        # "healthy=21" cache when live nodes are all cooled down / unhealthy.
         if last.get("total") is not None and not status.get("total"):
             status["total"] = last.get("total")
+        # Keep cache in sync with live truth for UI boot messages.
+        try:
+            self._embedded_proxy_last = {
+                **last,
+                "enabled": True,
+                "running": bool(status.get("running")),
+                "total": int(status.get("total") or 0),
+                "healthy": int(status.get("healthy") or 0),
+                "leases": int(status.get("leases") or 0),
+            }
+        except Exception:
+            pass
 
         boot_phase = str(boot.get("phase") or "idle")
         if boot_phase == "starting":

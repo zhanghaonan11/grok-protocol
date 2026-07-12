@@ -313,15 +313,42 @@ class EmbeddedProxyManager:
         self._config_path: Optional[Path] = None
         self._log_fp = None
 
+    def revive_cooled_nodes(self) -> int:
+        """Re-admit nodes whose cooldown has expired.
+
+        Failed nodes are marked healthy=False and given a future cooldown_until.
+        After that timestamp passes, revive them for another lease attempt.
+        Nodes with healthy=False and cooldown_until<=0 stay out until probe/start.
+        Returns how many nodes were revived.
+        """
+        now = time.time()
+        revived = 0
+        with self._lock:
+            for node in self._nodes.values():
+                if node.healthy:
+                    continue
+                cd = float(node.cooldown_until or 0.0)
+                # Only revive nodes that actually entered a timed cooldown.
+                if cd <= 0.0 or cd > now:
+                    continue
+                node.healthy = True
+                node.cooldown_until = 0.0
+                if getattr(node, "last_error", None):
+                    node.last_error = ""
+                revived += 1
+        return revived
+
     def acquire(self, exclude_ids: Optional[Set[str]] = None) -> Optional[NodeSlot]:
         exclude = exclude_ids or set()
+        # Always re-admit cooled-down nodes before leasing.
+        self.revive_cooled_nodes()
         now = time.time()
         with self._lock:
             candidates = [
                 node
                 for node in self._nodes.values()
                 if node.healthy
-                and now >= node.cooldown_until
+                and now >= float(node.cooldown_until or 0.0)
                 and node.id not in exclude
             ]
             if not candidates:
@@ -362,6 +389,8 @@ class EmbeddedProxyManager:
                 node.cooldown_until = time.time() + seconds
 
     def status(self) -> dict:
+        # Status should reflect post-cooldown availability, not sticky dead flags.
+        self.revive_cooled_nodes()
         with self._lock:
             nodes = list(self._nodes.values())
             healthy = sum(1 for n in nodes if n.healthy)
@@ -623,6 +652,7 @@ class EmbeddedProxyManager:
                 if healthy:
                     node.last_latency_ms = latency_ms
                     node.last_error = ""
+                    node.cooldown_until = 0.0
                     node.success_count += 1
                 else:
                     node.last_error = err
