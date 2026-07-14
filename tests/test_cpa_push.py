@@ -241,6 +241,45 @@ class CpaPushTests(unittest.TestCase):
             self.assertIn("cpaPushPanel", page.text)
             self.assertIn("测试推送连接", page.text)
 
+    def test_save_credential_file_logs_cpa_push(self):
+        import tempfile
+        from unittest.mock import patch
+
+        import xai_oauth
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg_path = root / "config.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "cpa_auto_upload": True,
+                        "cpa_api_url": self.base,
+                        "cpa_api_key": "cpa-secret",
+                        "cpa_use_local_name": True,
+                        "cpa_skip_duplicates": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            logs: list[str] = []
+            doc = _sample_payload("auto@example.com")
+            with patch.object(xai_oauth, "__file__", str(root / "xai_oauth.py")):
+                path = xai_oauth.save_credential_file(
+                    doc,
+                    str(root / "out"),
+                    log_callback=logs.append,
+                )
+            self.assertTrue(Path(path).is_file())
+            joined = "\n".join(logs)
+            self.assertIn("[CPA]", joined)
+            self.assertTrue(
+                any("推送成功" in line or "CPA 自动推送成功" in line for line in logs),
+                joined,
+            )
+            posts = [r for r in _FakeCpaHandler.requests if r[0] == "POST"]
+            self.assertEqual(len(posts), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

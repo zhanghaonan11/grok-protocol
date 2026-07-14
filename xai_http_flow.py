@@ -2428,7 +2428,7 @@ class BrowserlessXAIClient:
                 f"OAuth 账号与期望邮箱不一致: oauth={mask_email(token_email)} hint={mask_email(email_hint)}"
             )
         doc = build_credential_document(token_data, redirect_uri, token_endpoint)
-        path = save_credential_file(doc, output_dir)
+        path = save_credential_file(doc, output_dir, log_callback=self.log_callback)
         _log(self.log_callback, f"[HTTP] OAuth 凭证已保存 | email={mask_email(doc.get('email', ''))} | {path}")
         return path
 
@@ -2664,6 +2664,182 @@ class CloudflareTempMailbox:
             time.sleep(max(1, int(poll_interval or 3)))
         raise MailboxError(f"在 {timeout}s 内未收到 {mask_email(email)} 的 xAI 验证码")
 
+
+class DuckMailTempMailbox:
+    """DuckMail (mail.tm-style) adapter used by the GUI register path."""
+
+    DEFAULT_API_BASE = "https://api.duckmail.sbs"
+
+    def __init__(self, config: Dict[str, Any], *, proxy: str = "", timeout: int = DEFAULT_TIMEOUT):
+        self.config = dict(config or {})
+        self.base = str(
+            self.config.get("duckmail_api_base")
+            or self.config.get("duckmail_api_url")
+            or self.DEFAULT_API_BASE
+        ).rstrip("/")
+        self.api_key = str(self.config.get("duckmail_api_key") or "").strip()
+        self.timeout = max(5, int(timeout or DEFAULT_TIMEOUT))
+        self.proxies = _proxy_dict(proxy)
+        self.session = requests.Session(impersonate="chrome136")
+
+    def _request(self, method: str, url: str, **kwargs: Any) -> Any:
+        kwargs.setdefault("timeout", self.timeout)
+        if self.proxies and "proxies" not in kwargs:
+            kwargs["proxies"] = self.proxies
+        return getattr(self.session, method.lower())(url, **kwargs)
+
+    def _auth_headers(self, *, content_type: bool = False, bearer: str = "") -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        if content_type:
+            headers["content-type"] = "application/json"
+        token = str(bearer or self.api_key or "").strip()
+        if token:
+            headers["authorization"] = f"Bearer {token}"
+        return headers
+
+    def _domains(self) -> List[Dict[str, Any]]:
+        response = self._request(
+            "get",
+            f"{self.base}/domains",
+            headers=self._auth_headers(),
+        )
+        code = int(getattr(response, "status_code", 0) or 0)
+        if not 200 <= code < 300:
+            raise MailboxError(f"DuckMail domains HTTP {code}: {_safe_error_text(getattr(response, 'text', ''))}")
+        data = _response_json(response)
+        members = data.get("hydra:member") if isinstance(data, dict) else None
+        if isinstance(members, list):
+            return [item for item in members if isinstance(item, dict)]
+        return _pick_list_payload(data)
+
+    def _pick_domain(self) -> str:
+        domains = self._domains()
+        if not domains:
+            raise MailboxError("DuckMail 没有返回任何可用域名")
+        private = [d for d in domains if d.get("ownerId")]
+        verified_private = [d for d in private if d.get("isVerified")]
+        if verified_private:
+            domain = str(verified_private[0].get("domain") or "").strip()
+            if domain:
+                return domain
+        public = [d for d in domains if d.get("isVerified")]
+        if public:
+            domain = str(public[0].get("domain") or "").strip()
+            if domain:
+                return domain
+        # last resort: first domain field
+        for item in domains:
+            domain = str(item.get("domain") or "").strip()
+            if domain:
+                return domain
+        raise MailboxError("DuckMail 无已验证域名可用")
+
+    def create(self) -> Tuple[str, str]:
+        domain = self._pick_domain()
+        username = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(10))
+        address = f"{username}@{domain}"
+        password = secrets.token_urlsafe(12)
+        create_resp = self._request(
+            "post",
+            f"{self.base}/accounts",
+            json={"address": address, "password": password, "expiresIn": 0},
+            headers=self._auth_headers(content_type=True),
+        )
+        create_code = int(getattr(create_resp, "status_code", 0) or 0)
+        if not 200 <= create_code < 300:
+            raise MailboxError(
+                f"DuckMail create HTTP {create_code}: {_safe_error_text(getattr(create_resp, 'text', ''))}"
+            )
+        token_resp = self._request(
+            "post",
+            f"{self.base}/token",
+            json={"address": address, "password": password},
+            headers={"content-type": "application/json"},
+        )
+        token_code = int(getattr(token_resp, "status_code", 0) or 0)
+        if not 200 <= token_code < 300:
+            raise MailboxError(
+                f"DuckMail token HTTP {token_code}: {_safe_error_text(getattr(token_resp, 'text', ''))}"
+            )
+        token_data = _response_json(token_resp)
+        token = ""
+        if isinstance(token_data, dict):
+            token = str(token_data.get("token") or "").strip()
+            if not token and isinstance(token_data.get("data"), dict):
+                token = str(token_data["data"].get("token") or "").strip()
+        if not token:
+            raise MailboxError("获取 DuckMail token 失败")
+        return address, token
+
+    def _messages(self, token: str) -> List[Dict[str, Any]]:
+        response = self._request(
+            "get",
+            f"{self.base}/messages",
+            headers=self._auth_headers(bearer=token),
+        )
+        code = int(getattr(response, "status_code", 0) or 0)
+        if not 200 <= code < 300:
+            raise MailboxError(f"DuckMail messages HTTP {code}: {_safe_error_text(getattr(response, 'text', ''))}")
+        data = _response_json(response)
+        members = data.get("hydra:member") if isinstance(data, dict) else None
+        if isinstance(members, list):
+            return [item for item in members if isinstance(item, dict)]
+        return _pick_list_payload(data)
+
+    def _message_detail(self, token: str, message_id: str) -> Dict[str, Any]:
+        response = self._request(
+            "get",
+            f"{self.base}/messages/{message_id}",
+            headers=self._auth_headers(bearer=token),
+        )
+        code = int(getattr(response, "status_code", 0) or 0)
+        if not 200 <= code < 300:
+            return {}
+        data = _response_json(response)
+        return data if isinstance(data, dict) else {}
+
+    def wait_for_xai_code(
+        self,
+        email: str,
+        token: str,
+        *,
+        timeout: int = 45,
+        poll_interval: int = 2,
+        received_after_epoch: float = 0.0,
+    ) -> str:
+        deadline = time.monotonic() + max(5, int(timeout or 45))
+        seen: set = set()
+        while time.monotonic() < deadline:
+            try:
+                messages = self._messages(token)
+            except Exception:
+                time.sleep(max(1, int(poll_interval or 3)))
+                continue
+            for message in messages:
+                message_id = str(message.get("id") or message.get("@id") or "").strip()
+                if message_id.startswith("/messages/"):
+                    message_id = message_id.rsplit("/", 1)[-1]
+                if not message_id or message_id in seen:
+                    continue
+                subject_hint = str(message.get("subject") or "")
+                intro = str(message.get("intro") or message.get("text") or "")
+                sender = ""
+                from_obj = message.get("from")
+                if isinstance(from_obj, dict):
+                    sender = str(from_obj.get("address") or from_obj.get("email") or "")
+                elif isinstance(from_obj, str):
+                    sender = from_obj
+                if not _looks_like_xai_mail(subject_hint, intro, sender):
+                    # still inspect once later if nothing else arrives
+                    pass
+                seen.add(message_id)
+                detail = self._message_detail(token, message_id)
+                subject, body = _flatten_mail_bodies(message, detail)
+                code = extract_xai_email_code(body, subject, sender=sender)
+                if code:
+                    return code
+            time.sleep(max(1, int(poll_interval or 3)))
+        raise MailboxError(f"在 {timeout}s 内未收到 {mask_email(email)} 的 xAI 验证码")
 
 
 # Cross-process local Turnstile browser limiter.
@@ -3710,10 +3886,12 @@ def build_mailbox(
         return MicrosoftGraphMailbox(path, proxy=proxy, timeout=timeout)
     if provider == "yyds":
         return YydsTempMailbox(config, proxy=proxy, timeout=timeout)
+    if provider in {"duckmail", "duck", "mail.tm", "mailtm"}:
+        return DuckMailTempMailbox(config, proxy=proxy, timeout=timeout)
     if provider in {"cloudflare", "cf", "cloudflare_temp_email"}:
         return CloudflareTempMailbox(config, proxy=proxy, timeout=timeout)
     raise MailboxError(
-        f"不支持的 email_provider={provider!r}；可选 cloudflare / yyds / msgraph，"
+        f"不支持的 email_provider={provider!r}；可选 duckmail / cloudflare / yyds / msgraph，"
         "或直接传 --mail-file / --email + --email-code"
     )
 
@@ -4227,7 +4405,7 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument(
         "--mail-config",
         default="",
-        help="邮箱配置 JSON（email_provider=yyds|cloudflare|msgraph）；无 email/code 时自动创建和轮询",
+        help="邮箱配置 JSON（email_provider=duckmail|yyds|cloudflare|msgraph）；无 email/code 时自动创建和轮询",
     )
     register.add_argument(
         "--mail-file",
@@ -4428,6 +4606,7 @@ def _build_turnstile_browser_options(
     proxy: str = "",
     headless: bool = False,
     user_agent: str = "",
+    accept_language: str = "",
     log_callback: LogFn = None,
 ) -> Any:
     """Build Chromium launch options for local Turnstile capture.
@@ -4492,6 +4671,16 @@ def _build_turnstile_browser_options(
         "--no-sandbox",
         "--window-size=1365,900",
     ]
+    primary_lang = (
+        str(accept_language or DEFAULT_ACCEPT_LANGUAGE)
+        .split(",", 1)[0]
+        .split(";", 1)[0]
+        .strip()
+    )
+    if primary_lang:
+        # Align navigator.language with HTTP Accept-Language so the post-capture
+        # fingerprint check does not reject an otherwise valid token.
+        args.append(f"--lang={primary_lang}")
     for arg in args:
         _safe_call(getattr(options, "set_argument", None), arg)
 
@@ -4499,10 +4688,14 @@ def _build_turnstile_browser_options(
         "credentials_enable_service": False,
         "profile.password_manager_enabled": False,
     }
+    if primary_lang:
+        prefs["intl.accept_languages"] = str(accept_language or primary_lang).strip()
     set_pref = getattr(options, "set_pref", None)
     if callable(set_pref):
         for key, value in prefs.items():
             _safe_call(set_pref, key, value)
+    if primary_lang:
+        _log(log_callback, f"[Turnstile] 浏览器语言: {primary_lang}")
 
     # Only override UA when the caller explicitly asks.  Default to the real
     # installed Chrome UA so headed direct sessions match manual browsing.
@@ -5465,7 +5658,11 @@ def _capture_turnstile_token_impl(
             options=ChromiumOptions(),
             proxy=proxy,
             headless=bool(use_headless),
+            # Prefer the real installed Chrome UA (empty). Forcing a synthetic
+            # UA frequently trips CF; language is still aligned below so the
+            # post-capture fingerprint check can pass without rewriting UA.
             user_agent="",
+            accept_language=accept_language or DEFAULT_ACCEPT_LANGUAGE,
             log_callback=log_callback,
         )
         _log(log_callback, f"[Turnstile] 正在启动浏览器 mode={mode} headless={use_headless}")

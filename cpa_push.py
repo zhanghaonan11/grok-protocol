@@ -494,8 +494,15 @@ def auto_push_credential_file(
         "source": str(path),
         "json_name": path.name,
     }
+    skip_duplicates = bool(config.get("cpa_skip_duplicates", True))
     try:
-        return upload_cpa_items(base_url, api_key, [item], log=log, skip_duplicates=True)
+        return upload_cpa_items(
+            base_url,
+            api_key,
+            [item],
+            log=log,
+            skip_duplicates=skip_duplicates,
+        )
     except Exception as exc:
         log(f"CPA 自动推送失败 {path.name}: {exc}")
         return {"ok": False, "message": str(exc)}

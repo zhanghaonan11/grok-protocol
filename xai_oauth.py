@@ -270,7 +270,7 @@ def build_credential_document(token_data, redirect_uri, token_endpoint):
     return doc
 
 
-def save_credential_file(doc, output_dir):
+def save_credential_file(doc, output_dir, log_callback=None):
     output_dir = os.path.abspath(str(output_dir or "").strip() or os.getcwd())
     os.makedirs(output_dir, mode=0o700, exist_ok=True)
     file_name = credential_file_name(doc.get("email", ""), doc.get("sub", ""))
@@ -278,7 +278,8 @@ def save_credential_file(doc, output_dir):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(doc, f, ensure_ascii=False, indent=2)
         f.write("\n")
-    # Best-effort CPA auto push (config-driven). Never break credential write.
+    # Best-effort CPA auto push (config-driven). Never break credential write,
+    # but always surface success/skip/failure so register logs are not silent.
     try:
         import cpa_push
         from pathlib import Path as _Path
@@ -288,12 +289,59 @@ def save_credential_file(doc, output_dir):
         if cfg_path.is_file():
             try:
                 cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as cfg_exc:
+                _oauth_log(log_callback, f"读取 config.json 失败，跳过 CPA 自动推送: {cfg_exc}", level="warn")
                 cfg = {}
-        if isinstance(cfg, dict) and cfg.get("cpa_auto_upload"):
-            cpa_push.auto_push_credential_file(config=cfg, credential_path=path)
-    except Exception:
-        pass
+        if not (isinstance(cfg, dict) and cfg.get("cpa_auto_upload")):
+            return path
+
+        def _cpa_log(msg: str) -> None:
+            text = str(msg or "").strip()
+            if not text:
+                return
+            # Prefer the caller's log stream (WebUI/TUI/worker). Fall back to
+            # stdout so CLI credential writes still show CPA outcomes.
+            if log_callback:
+                try:
+                    log_callback(f"[CPA] {text}")
+                    return
+                except Exception:
+                    pass
+            print(f"[CPA] {text}", flush=True)
+
+        result = cpa_push.auto_push_credential_file(
+            config=cfg,
+            credential_path=path,
+            log=_cpa_log,
+        )
+        if not isinstance(result, dict):
+            return path
+        success = int(result.get("success") or 0)
+        skipped = int(result.get("skipped") or 0)
+        failed = int(result.get("failed") or 0)
+        message = str(result.get("message") or "").strip()
+        if success > 0 and failed <= 0:
+            _oauth_log(
+                log_callback,
+                f"CPA 自动推送成功 | file={os.path.basename(path)} | {message or f'success={success}'}",
+                level="ok",
+            )
+        elif result.get("skipped") and not success:
+            _oauth_log(
+                log_callback,
+                f"CPA 自动推送已跳过 | file={os.path.basename(path)} | {message or 'duplicate/invalid'}",
+                level="warn",
+            )
+        elif failed > 0 or result.get("ok") is False:
+            _oauth_log(
+                log_callback,
+                f"CPA 自动推送失败 | file={os.path.basename(path)} | {message or result}",
+                level="warn",
+            )
+    except Exception as exc:
+        _oauth_log(log_callback, f"CPA 自动推送异常: {exc}", level="warn")
+        if not log_callback:
+            print(f"[CPA] 自动推送异常: {exc}", flush=True)
     return path
 
 
@@ -2527,7 +2575,7 @@ def run_xai_oauth_after_sso(
             token_data["email"] = str(email_hint).strip()
 
         doc = build_credential_document(token_data, redirect_uri, token_endpoint)
-        path = save_credential_file(doc, output_dir)
+        path = save_credential_file(doc, output_dir, log_callback=log_callback)
         _oauth_log(log_callback, f"凭证已保存 path={path}", level="ok")
         _oauth_log(log_callback, "OAuth 完成，正在关闭回调服务并返回主流程...", level="debug")
         return path
