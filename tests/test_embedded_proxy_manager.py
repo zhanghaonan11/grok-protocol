@@ -54,6 +54,49 @@ class LeaseTests(unittest.TestCase):
         )
 
 
+
+    def test_tls_consecutive_fails_extend_cooldown(self):
+        m = self._mgr(1)
+        n = m.acquire()
+        nid = n.id
+        m.release(nid, failed=True, reason="curl: (35) TLS connect error")
+        cd1 = m._nodes[nid].cooldown_until
+        self.assertFalse(m._nodes[nid].healthy)
+        self.assertEqual(m._nodes[nid].consecutive_tls_fails, 1)
+        self.assertGreater(cd1, time.time())
+        # force expire and release again with TLS
+        m._nodes[nid].healthy = True
+        m._nodes[nid].cooldown_until = 0
+        m._nodes[nid].ref_count = 1
+        m.release(nid, failed=True, reason="OPENSSL_internal:invalid library")
+        self.assertEqual(m._nodes[nid].consecutive_tls_fails, 2)
+        self.assertGreater(m._nodes[nid].cooldown_until - time.time(), 60.0)
+
+    def test_non_tls_failure_resets_tls_streak(self):
+        m = self._mgr(1)
+        n = m.acquire()
+        nid = n.id
+        m.release(nid, failed=True, reason="curl: (35) TLS connect error")
+        self.assertEqual(m._nodes[nid].consecutive_tls_fails, 1)
+        m._nodes[nid].healthy = True
+        m._nodes[nid].cooldown_until = 0
+        m._nodes[nid].ref_count = 1
+        m.release(nid, failed=True, reason="Connection refused")
+        self.assertEqual(m._nodes[nid].consecutive_tls_fails, 0)
+
+    def test_success_release_resets_tls_streak(self):
+        m = self._mgr(1)
+        n = m.acquire()
+        nid = n.id
+        m.release(nid, failed=True, reason="curl: (35) TLS connect error")
+        self.assertEqual(m._nodes[nid].consecutive_tls_fails, 1)
+        m._nodes[nid].healthy = True
+        m._nodes[nid].cooldown_until = 0
+        m._nodes[nid].ref_count = 1
+        m.release(nid, failed=False)
+        self.assertEqual(m._nodes[nid].consecutive_tls_fails, 0)
+
+
 class ConfigGenTests(unittest.TestCase):
     def test_build_mihomo_config_maps_ports_and_proxies(self):
         from embedded_proxy_manager import NodeSlot, build_mihomo_config
@@ -78,6 +121,62 @@ class ConfigGenTests(unittest.TestCase):
         self.assertEqual(cfg["listeners"][1]["port"], 28001)
         # 每个 listener 绑定对应 proxy
         self.assertEqual(cfg["listeners"][0]["proxy"], cfg["proxies"][0]["name"])
+
+    def test_build_mihomo_config_hysteria2_and_anytls(self):
+        from embedded_proxy_manager import (
+            NodeSlot,
+            build_mihomo_config,
+            parse_anytls_node,
+            parse_hysteria2_node,
+        )
+
+        hy = parse_hysteria2_node(
+            "hy2://secret@hy.example:8443?sni=hy.example&insecure=1&obfs=salamander&obfs-password=op#hy-a"
+        )
+        anytls = parse_anytls_node(
+            "anytls://pwd@any.example:443?sni=any.example&fp=chrome#any-a"
+        )
+        self.assertIsNotNone(hy)
+        self.assertIsNotNone(anytls)
+        nodes = [
+            NodeSlot(
+                id="hy1",
+                name=hy["name"],
+                server=hy["server"],
+                port=hy["port"],
+                protocol="hysteria2",
+                local_http="",
+                password=hy["password"],
+                params=hy["params"],
+                raw=hy["raw"],
+            ),
+            NodeSlot(
+                id="any1",
+                name=anytls["name"],
+                server=anytls["server"],
+                port=anytls["port"],
+                protocol="anytls",
+                local_http="",
+                password=anytls["password"],
+                params=anytls["params"],
+                raw=anytls["raw"],
+            ),
+        ]
+        cfg = build_mihomo_config(nodes, listen_host="127.0.0.1", base_port=29000)
+        self.assertEqual(len(cfg["proxies"]), 2)
+        types = {p["type"] for p in cfg["proxies"]}
+        self.assertEqual(types, {"hysteria2", "anytls"})
+        hy_proxy = next(p for p in cfg["proxies"] if p["type"] == "hysteria2")
+        self.assertEqual(hy_proxy["password"], "secret")
+        self.assertEqual(hy_proxy["sni"], "hy.example")
+        self.assertTrue(hy_proxy.get("skip-cert-verify"))
+        self.assertEqual(hy_proxy.get("obfs"), "salamander")
+        any_proxy = next(p for p in cfg["proxies"] if p["type"] == "anytls")
+        self.assertEqual(any_proxy["password"], "pwd")
+        self.assertEqual(any_proxy["sni"], "any.example")
+        self.assertEqual(any_proxy.get("client-fingerprint"), "chrome")
+        self.assertEqual(cfg["listeners"][0]["port"], 29000)
+        self.assertTrue(nodes[0].local_http.startswith("http://127.0.0.1:"))
 
 
 class LifecycleTests(unittest.TestCase):

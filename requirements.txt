@@ -23,3 +23,6 @@ fastapi
 uvicorn
 jinja2
 httpx
+
+# CPA 巡检台
+python-multipart>=0.0.9

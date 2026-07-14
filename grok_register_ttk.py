@@ -253,6 +253,12 @@ from local_proxy_forwarder import (
     parse_proxy_string,
     stop_local_forwarder,
 )
+from proxy_pool import (
+    configure_global_rotator,
+    get_global_rotator,
+    normalize_proxy_line,
+    validate_proxy_line,
+)
 import turnstile_flow as _tf
 from turnstile_flow import (
     SCENE_FINAL,
@@ -460,6 +466,7 @@ def load_proxy_file_entries(log_callback=None):
             log_callback(f"[!] 读取代理文件失败: {path} | {exc}")
         return []
     items = []
+    skipped = 0
     for line in lines:
         s = str(line or "").strip()
         if not s or s.startswith("#"):
@@ -467,31 +474,52 @@ def load_proxy_file_entries(log_callback=None):
         # allow accidental quotes around a whole line
         if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
             s = s[1:-1].strip()
-        if s:
-            items.append(s)
+        normalized, err = validate_proxy_line(s)
+        if err or not normalized:
+            skipped += 1
+            continue
+        items.append(normalized)
+    if skipped and log_callback:
+        log_callback(f"[!] 代理文件跳过无效条目 {skipped} 条（如 host=null）")
     return items
 
 
-def get_proxy_pool(log_callback=None):
+def get_proxy_pool(log_callback=None, *, sync_rotator=True):
     """Collect proxy candidates from proxies.txt + config.proxies + config.proxy.
 
     Preferred manual config:
       proxies.txt  (plain text, one proxy per line, no JSON quotes)
+
+    Invalid hosts (null/none/empty) are dropped. When sync_rotator=True, the
+    process-level ProxyRotator is refreshed from the resulting pool.
     """
     pool = []
     seen = set()
+    skipped = 0
     sources = (
-        load_proxy_file_entries(log_callback=log_callback),
+        load_proxy_file_entries(log_callback=None),
         config.get("proxies"),
         config.get("proxy"),
     )
     for source in sources:
         for item in _split_proxy_entries(source):
-            key = item.strip()
-            if not key or key in seen:
+            normalized, err = validate_proxy_line(item)
+            if err or not normalized:
+                skipped += 1
                 continue
-            seen.add(key)
-            pool.append(key)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            pool.append(normalized)
+    if skipped and log_callback:
+        log_callback(f"[!] 代理池跳过无效条目 {skipped} 条")
+    if sync_rotator:
+        try:
+            stats = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy_stats.log")
+            configure_global_rotator(pool, stats_file=stats)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[!] 代理轮换器初始化失败: {exc}")
     return pool
 
 
@@ -690,15 +718,52 @@ def preflight_proxy(raw, log_callback=None, health_raw=None):
         return False
 
 
+def report_proxy_outcome(success: bool, reason: str = "", proxy_raw: str = "") -> None:
+    """Feed registration / preflight outcome into the GPT-style ProxyRotator."""
+    target = str(proxy_raw or _active_proxy_raw or "").strip()
+    if not target:
+        return
+    try:
+        rotator = get_global_rotator()
+        if rotator is None:
+            return
+        pool = list(rotator.proxies())
+        key = target
+        if target not in pool:
+            norm = normalize_proxy_line(target)
+            if norm in pool:
+                key = norm
+            else:
+                host = ""
+                try:
+                    up = parse_proxy_string(target)
+                    host = f"{up.host}:{up.port}" if up else ""
+                except Exception:
+                    host = ""
+                if host:
+                    for item in pool:
+                        if host in item:
+                            key = item
+                            break
+        rotator.record_result(key, bool(success), reason=str(reason or "")[:120])
+        if success:
+            rotator.mark_good(key)
+        else:
+            rotator.mark_bad(key)
+    except Exception:
+        pass
+
+
 def select_proxy_for_browser(log_callback=None, force_new=True):
     """Pick an upstream proxy for the next browser launch.
 
-    - If proxy_random=true (default) and pool size>1: random choice
+    - Prefer GPT-style ProxyRotator (country weight + dynamic cooldown)
+    - Fall back to random/fixed scan with preflight + blacklist
     - If proxy_rotate_session=true: randomize kookeey-like session id
     - Stores selection in module globals for get_runtime_proxy_url()
     """
     global _active_proxy_raw, _active_proxy_display
-    pool = get_proxy_pool(log_callback=log_callback)
+    pool = get_proxy_pool(log_callback=log_callback, sync_rotator=True)
     if not pool:
         _active_proxy_raw = ""
         _active_proxy_display = ""
@@ -709,12 +774,26 @@ def select_proxy_for_browser(log_callback=None, force_new=True):
 
     do_random = bool(config.get("proxy_random", True))
     attempts = min(len(pool), max(1, int(config.get("proxy_preflight_max_attempts", 6) or 6)))
-    ordered = list(pool)
+    rotator = get_global_rotator()
+
+    ordered = []
+    seen = set()
+    if rotator is not None and len(rotator) > 0 and (do_random or force_new):
+        for _ in range(min(len(pool), max(attempts * 2, 4))):
+            cand = rotator.next()
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            ordered.append(cand)
+    rest = list(pool)
     if do_random:
-        random.shuffle(ordered)
-    elif _active_proxy_raw and _active_proxy_raw in ordered and not force_new:
-        ordered.remove(_active_proxy_raw)
-        ordered.insert(0, _active_proxy_raw)
+        random.shuffle(rest)
+    elif _active_proxy_raw and _active_proxy_raw in rest and not force_new:
+        rest.remove(_active_proxy_raw)
+        rest.insert(0, _active_proxy_raw)
+    for item in rest:
+        if item not in seen:
+            ordered.append(item)
 
     chosen = ""
     rotated = ""
@@ -730,13 +809,18 @@ def select_proxy_for_browser(log_callback=None, force_new=True):
         if preflight_proxy(candidate_rotated, log_callback=log_callback, health_raw=candidate):
             chosen = candidate
             rotated = candidate_rotated
+            report_proxy_outcome(True, "preflight_ok", proxy_raw=candidate)
             break
+        report_proxy_outcome(False, "preflight_fail", proxy_raw=candidate)
         if tested >= attempts:
             break
 
     if not chosen:
         fallback_pool = [p for p in ordered if not is_proxy_blacklisted(p)[0]] or ordered
-        chosen = fallback_pool[0] if not do_random else random.choice(fallback_pool)
+        if rotator is not None and len(rotator) > 0:
+            chosen = rotator.next() or (fallback_pool[0] if fallback_pool else "")
+        else:
+            chosen = fallback_pool[0] if not do_random else random.choice(fallback_pool)
         rotated = _rotate_kookeey_session(chosen) if bool(config.get("proxy_rotate_session", True)) else chosen
         if log_callback:
             log_callback(f"[!] 未找到预检通过代理，使用候选继续 | skipped_blacklist={skipped_blacklist} tested={tested}")
@@ -751,7 +835,7 @@ def select_proxy_for_browser(log_callback=None, force_new=True):
     stop_local_forwarder()
     if log_callback:
         pool_n = len(pool)
-        mode = "random" if do_random else "fixed"
+        mode = "rotator" if rotator is not None else ("random" if do_random else "fixed")
         proxy_file = _resolve_proxy_file_path()
         file_hint = os.path.basename(proxy_file) if proxy_file and os.path.exists(proxy_file) else "-"
         chosen_disp = _format_proxy_for_log(chosen)

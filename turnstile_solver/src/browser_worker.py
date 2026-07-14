@@ -840,13 +840,35 @@ class BrowserWorker:
                 user_agent=user_agent,
                 min_len=min_len,
                 diagnose=diagnose or True,  # keep diagnostics on for Phase1 live debugging
+                sitekey=str(request.sitekey or "").strip(),
+                action=str(request.action or "").strip(),
+                cdata=str(request.cdata or "").strip(),
+                accept_language=str(
+                    request.accept_language
+                    or getattr(getattr(request, "fingerprint", None), "accept_language", "")
+                    or self.config.accept_language
+                    or ""
+                ).strip(),
             )
             elapsed_ms = int((time.monotonic() - started) * 1000)
+            diag = diag if isinstance(diag, dict) else {}
             extras = {
                 "browser_proxy": browser_proxy,
                 "parent_proxy": normalize_proxy(parent_proxy),
                 "forwarder_instance": forwarder_instance,
                 "diagnostics": diag,
+                "language": str(diag.get("language") or "").strip(),
+                "platform": str(diag.get("platform") or "").strip(),
+                "client_hint_platform": str(diag.get("client_hint_platform") or "").strip(),
+                "browser_major": str(diag.get("browser_major") or "").strip(),
+            }
+            # Surface a lightweight fingerprint so HTTP-side validation can
+            # compare language/platform when present.
+            extras["fingerprint"] = {
+                "navigator_language": extras["language"],
+                "platform": extras["platform"],
+                "client_hint_platform": extras["client_hint_platform"],
+                "browser_major": extras["browser_major"],
             }
             if len(token) < min_len:
                 return SolveResult(
@@ -933,6 +955,15 @@ class BrowserWorker:
             _log(self.log_callback, f"[Turnstile] 常驻浏览器已打开注册页: {page_url}")
 
             sitekey = str(request.sitekey or "").strip()
+            # Real xAI signup pages often keep Turnstile gated behind the email
+            # entry step. Always try that first, then inject the known sitekey.
+            remaining = max(0, int(deadline - time.monotonic()))
+            if remaining > 0:
+                click_email_signup_entry(
+                    page,
+                    log_callback=self.log_callback,
+                    timeout=min(12, remaining),
+                )
             if sitekey:
                 _ensure_injected_turnstile_widget(
                     page,
@@ -943,14 +974,6 @@ class BrowserWorker:
                     log_callback=self.log_callback,
                     wait_api_sec=min(3.0, max(0.0, deadline - time.monotonic())),
                 )
-            else:
-                remaining = max(0, int(deadline - time.monotonic()))
-                if remaining > 0:
-                    click_email_signup_entry(
-                        page,
-                        log_callback=self.log_callback,
-                        timeout=min(12, remaining),
-                    )
 
             next_diag_at = 0.0
             next_inject_at = time.monotonic() + 4.0
@@ -1079,6 +1102,10 @@ class BrowserWorker:
         user_agent: str,
         min_len: int,
         diagnose: bool,
+        sitekey: str = "",
+        action: str = "",
+        cdata: str = "",
+        accept_language: str = "",
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Prefer parent-project enhanced capture, then fall back to local loop."""
         # 1) Parent enhanced capture (click email + prime + shadow nudge + diagnostics)
@@ -1091,7 +1118,7 @@ class BrowserWorker:
                 logs.append(str(msg))
                 _log(self.log_callback, msg)
 
-            token = parent_capture(
+            capture_out = parent_capture(
                 proxy=browser_proxy,
                 output="",
                 proxy_used_file="",
@@ -1100,15 +1127,32 @@ class BrowserWorker:
                 headless=headless,
                 page_url=page_url,
                 click_email_signup=True,
+                sitekey=str(sitekey or "").strip(),
+                action=str(action or "").strip(),
+                cdata=str(cdata or "").strip(),
+                user_agent=str(user_agent or "").strip(),
+                accept_language=str(accept_language or "").strip(),
                 log_callback=_cb,
+                return_result=True,
             )
-            token = str(token or "").strip()
+            extras = {}
+            if hasattr(capture_out, "token"):
+                token = str(getattr(capture_out, "token", "") or "").strip()
+                effective_ua = str(getattr(capture_out, "user_agent", "") or user_agent or "").strip()
+                extras = dict(getattr(capture_out, "extras", None) or {})
+            else:
+                token = str(capture_out or "").strip()
+                effective_ua = str(user_agent or "").strip()
             diag = {
                 "source": "xai_http_flow.capture_turnstile_token",
                 "logs_tail": logs[-12:],
                 "token_len": len(token),
+                "language": extras.get("language") or "",
+                "platform": extras.get("platform") or "",
+                "client_hint_platform": extras.get("client_hint_platform") or "",
+                "browser_major": extras.get("browser_major") or "",
             }
-            return token, user_agent, diag
+            return token, effective_ua, diag
         except Exception as parent_exc:
             _log(self.log_callback, f"[Turnstile][warn] parent capture failed, fallback local: {parent_exc}")
 
@@ -1234,7 +1278,64 @@ for (const n of nodes) {
             )
             return token, effective_ua, diag
         finally:
+            browser_pid = 0
+            try:
+                for name in ("process_id", "pid", "_process_id"):
+                    value = getattr(browser, name, 0)
+                    try:
+                        value = value() if callable(value) else value
+                        browser_pid = int(value or 0)
+                    except (TypeError, ValueError):
+                        browser_pid = 0
+                    if browser_pid > 1:
+                        break
+            except Exception:
+                browser_pid = 0
             try:
                 browser.quit()
             except Exception:
                 pass
+            # Fallback path is outside the pool; force-reap chrome tree + zombies.
+            try:
+                from .browser_runtime import _reap_chrome_process_tree, _reap_zombie_children
+
+                if browser_pid > 1:
+                    _reap_chrome_process_tree(browser_pid, timeout_sec=2.0)
+                _reap_zombie_children()
+            except Exception:
+                try:
+                    import os
+                    import signal
+                    import time as _time
+
+                    if browser_pid > 1:
+                        try:
+                            os.kill(browser_pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        deadline = _time.time() + 1.5
+                        while _time.time() < deadline:
+                            try:
+                                waited, _ = os.waitpid(browser_pid, os.WNOHANG)
+                            except ChildProcessError:
+                                break
+                            if waited == browser_pid:
+                                break
+                            _time.sleep(0.05)
+                        try:
+                            os.kill(browser_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            os.waitpid(browser_pid, 0)
+                        except (ChildProcessError, OSError):
+                            pass
+                    while True:
+                        try:
+                            pid, _ = os.waitpid(-1, os.WNOHANG)
+                        except (ChildProcessError, OSError):
+                            break
+                        if pid <= 0:
+                            break
+                except Exception:
+                    pass

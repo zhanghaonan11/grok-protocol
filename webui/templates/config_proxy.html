@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>注册代理 · xAI HTTP</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/static/favicon.ico" sizes="any" />
+  <link rel="icon" href="/static/favicon-32.png" type="image/png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png" sizes="180x180" />
+  <link rel="stylesheet" href="/static/app.css?v=egress6-1" />
+</head>
+<body>
+  <header class="top">
+    <div class="top-main">
+      <div>
+        <h1>注册代理</h1>
+        <p class="muted">本机 {{ host }}:{{ port }} · 点大按钮就行</p>
+      </div>
+      <nav class="nav" aria-label="主导航">
+        <a href="/" class="{% if active == 'run' %}active{% endif %}">运行台</a>
+        <a href="/config" class="{% if active == 'config' %}active{% endif %}">配置中心</a>
+        <a href="/credentials" class="{% if active == 'credentials' %}active{% endif %}">凭证列表</a>
+        <a href="/cpa" class="{% if active == 'cpa' %}active{% endif %}">CPA 巡检</a>
+      </nav>
+      <nav class="nav subnav" aria-label="配置分区">
+        <a href="/config" class="">总览</a>
+        <a href="/config/mail" class="">邮箱 / 验证码</a>
+        <a href="/config/output" class="">产物 / 推送</a>
+        <a href="/config/proxy" class="active">注册代理</a>
+        <a href="/config/turnstile" class="">求解代理</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="panel wide">
+      <div class="actions" style="margin-top:0" data-config-page="proxy">
+        <button type="button" id="btnReloadCfg">重载</button>
+        <button type="button" id="btnSaveCfg" class="primary">保存配置</button>
+        <button type="button" id="btnTestPool">测试代理池</button>
+      </div>
+      <p id="cfgMsg" class="msg"></p>
+    </section>
+
+    <form id="cfgCenterForm" class="cfg-form">
+      <section class="panel wide">
+        <h2>出口方式</h2>
+        <p class="muted">点一个大按钮就选好代理模式，再点顶部「保存配置」。高级项默认收起来。</p>
+
+        <div class="egress-presets" id="egressPresets" role="group" aria-label="出口方式">
+          <button type="button" class="egress-card" data-egress-preset="nodes">
+            <strong>只用节点池</strong>
+            <span>VLESS/Hy2 订阅 → mihomo</span>
+          </button>
+          <button type="button" class="egress-card" data-egress-preset="http">
+            <strong>只用 HTTP 池</strong>
+            <span>手写 / 订阅 HTTP 代理</span>
+          </button>
+          <button type="button" class="egress-card" data-egress-preset="hybrid">
+            <strong>一起用</strong>
+            <span>节点池 + HTTP 池轮询</span>
+          </button>
+          <button type="button" class="egress-card" data-egress-preset="direct">
+            <strong>固定一个</strong>
+            <span>只用一个 HTTP 代理 URL</span>
+          </button>
+          <button type="button" class="egress-card" data-egress-preset="auto">
+            <strong>自动</strong>
+            <span>有固定 URL 用固定，否则走 HTTP 池</span>
+          </button>
+          <button type="button" class="egress-card" data-egress-preset="off">
+            <strong>完全关闭</strong>
+            <span>节点池和 HTTP 池都不用</span>
+          </button>
+        </div>
+        <p class="muted" id="egressModeHint">当前生效：读取中…</p>
+        <p class="muted" id="egressModeDetail">组合：-</p>
+
+        <!-- 隐藏技术字段：由大按钮驱动，保存时仍会提交 -->
+        <div class="sr-only-fields" aria-hidden="true">
+          <select name="proxy_mode" id="proxyModeSelect">
+            <option value="auto">自动</option>
+            <option value="none">关闭 HTTP 侧</option>
+            <option value="direct">固定 HTTP URL</option>
+            <option value="pool">HTTP 代理池</option>
+          </select>
+          <input type="checkbox" name="embedded_proxy_enabled" id="embeddedProxyEnabled" />
+          <input name="proxy_file" type="text" value="proxies.txt" />
+          <input name="proxy_parent" type="text" />
+          <input name="local_proxy_port" type="number" value="17890" />
+          <input type="checkbox" name="proxy_random" checked />
+          <input type="checkbox" name="proxy_rotate_session" />
+          <input name="embedded_proxy_max_node_retries" type="number" value="3" />
+          <input name="embedded_proxy_binary" type="text" />
+          <input name="embedded_proxy_listen_host" type="text" value="127.0.0.1" />
+          <input name="embedded_proxy_base_port" type="number" value="28000" />
+          <input name="embedded_proxy_max_nodes" type="number" value="50" />
+          <input name="embedded_proxy_probe_host" type="text" value="accounts.x.ai" />
+          <input name="embedded_proxy_probe_port" type="number" value="443" />
+          <input name="embedded_proxy_probe_timeout_sec" type="number" value="5" />
+          <input name="proxy_subscription_local_http" type="text" />
+        </div>
+
+        <div class="proxy-sub" id="directProxyPanel" hidden>
+          <label class="full-width">
+            <span class="field-title">固定代理 URL</span>
+            <input name="proxy" type="text" placeholder="http://user:pass@host:port" />
+          </label>
+        </div>
+      </section>
+
+      <div class="proxy-columns">
+        <section class="panel proxy-col proxy-col-reg" id="httpPoolPanel" data-active-pool-source="manual">
+          <h2>HTTP 代理池</h2>
+          <p class="muted" id="httpPoolHint">一行一个代理。VLESS 别写这里。</p>
+
+          <div class="simple-tabs" id="proxySourceTabs" role="tablist">
+            <button type="button" class="simple-tab is-active" data-pool-source="manual">手动粘贴</button>
+            <button type="button" class="simple-tab" data-pool-source="subscription">订阅导入</button>
+          </div>
+          <select name="proxy_pool_source" id="proxyPoolSource" class="sr-only-fields" aria-hidden="true">
+            <option value="manual">手动维护</option>
+            <option value="subscription">订阅导入 HTTP</option>
+          </select>
+
+          <div id="regSourceManual" data-pool-source-panel="manual">
+            <p class="muted" id="poolMeta">代理池: -</p>
+            <textarea id="proxyPoolText" class="pool" spellcheck="false" placeholder="http://127.0.0.1:28003&#10;host:port:user:pass"></textarea>
+            <div class="actions">
+              <button type="button" id="btnSavePool" class="primary">保存代理池</button>
+              <button type="button" id="btnImportCleanEmbedded">导入 clean 口</button>
+              <button type="button" id="btnClearProxyPoolManual">清空代理池</button>
+            </div>
+            <pre id="proxyTestResult" class="box log">尚未测试</pre>
+          </div>
+
+          <div id="regSourceSubscription" data-pool-source-panel="subscription" hidden>
+            <p class="muted">订阅链接请在右边「节点池」填写（两边共用）。这里只负责把订阅里的 <strong>HTTP</strong> 节点写入代理池。</p>
+            <div class="actions">
+              <button type="button" id="btnImportSub" class="primary">拉取并写入 HTTP 池</button>
+              <button type="button" id="btnClearProxyPool">清空 HTTP 代理池</button>
+            </div>
+            <pre id="proxySubImportResult" class="box log">尚未拉取</pre>
+            <textarea id="proxyPoolTextPreview" class="pool" spellcheck="false" readonly placeholder="导入后预览"></textarea>
+          </div>
+        </section>
+
+        <section class="panel proxy-col" id="nodePoolPanel">
+          <h2>节点池</h2>
+          <p class="muted" id="nodePoolHint">三步：填订阅 → 拉节点 / 手改缓存 → 启动。订阅和节点都能改、都能一键清空。</p>
+
+          <div class="node-step">
+            <div class="node-step-head">
+              <strong>1. 订阅链接</strong>
+              <span class="muted">可直接手改，一行一个</span>
+            </div>
+            <label class="full-width">
+              <span class="field-title">订阅 URL</span>
+              <textarea name="proxy_subscription_urls" id="proxySubscriptionUrls" class="pool" rows="4" spellcheck="false" placeholder="https://example.com/sub1&#10;https://example.com/sub2"></textarea>
+            </label>
+            <div class="actions">
+              <button type="button" id="btnEmbeddedFetchSub" class="primary">拉节点到缓存</button>
+              <button type="button" id="btnClearSubUrls">一键清空订阅</button>
+              <button type="button" id="btnClearSubUrlsAndSave">清空订阅并保存</button>
+            </div>
+          </div>
+
+          <div class="node-step">
+            <div class="node-step-head">
+              <strong>2. 节点缓存（手动编辑）</strong>
+              <span class="muted">支持 vless / hysteria2 / anytls，一行一个</span>
+            </div>
+            <label class="full-width">
+              <span class="field-title">节点列表</span>
+              <textarea id="embeddedNodeCacheText" class="pool" rows="10" spellcheck="false" placeholder="vless://...&#10;hysteria2://...&#10;anytls://..."></textarea>
+            </label>
+            <p class="muted" id="embeddedCacheMeta">缓存: -</p>
+            <div class="actions">
+              <button type="button" id="btnLoadEmbeddedCache">刷新编辑框</button>
+              <button type="button" id="btnSaveEmbeddedCache" class="primary">保存节点缓存</button>
+              <button type="button" id="btnClearEmbeddedCache">一键清空节点</button>
+            </div>
+          </div>
+
+          <div class="node-step">
+            <div class="node-step-head">
+              <strong>3. 启动与状态</strong>
+              <span class="muted">用上面缓存启动 mihomo</span>
+            </div>
+            <div class="actions">
+              <button type="button" id="btnEmbeddedStart" class="primary">启动/重载</button>
+              <button type="button" id="btnEmbeddedProbe">探测</button>
+              <button type="button" id="btnEmbeddedStop">停止</button>
+              <button type="button" id="btnEmbeddedStatus">刷新状态</button>
+            </div>
+            <div class="actions" id="nodeToHttpSyncActions">
+              <button type="button" id="btnSyncHealthyToPool">健康节点 → 写 HTTP 池</button>
+              <button type="button" id="btnSyncAllToPool">全部节点 → 写 HTTP 池</button>
+            </div>
+            <p class="muted" id="embeddedProxySummary">状态: 未刷新</p>
+            <pre id="embeddedProxyStatus" class="box log">尚未查询</pre>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel wide">
+        <details class="advanced-box" id="proxyAdvancedBox">
+          <summary>高级设置（一般不用打开）</summary>
+          <div class="form compact-form" id="proxyAdvancedForm">
+            <label>
+              <span class="field-title">代理模式（HTTP 侧）</span>
+              <select id="proxyModeSelectVisible">
+                <option value="auto">自动：有固定 URL 用固定，否则 HTTP 池</option>
+                <option value="none">关闭 HTTP 侧（可只开节点池）</option>
+                <option value="direct">固定一个 HTTP 代理 URL</option>
+                <option value="pool">HTTP 代理池</option>
+              </select>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="embeddedProxyEnabledVisible" />
+              <span class="field-title">启用节点池（mihomo）</span>
+            </label>
+            <p class="muted full-width" id="egressComboHint">组合说明会显示在这里</p>
+            <label>
+              <span class="field-title">代理池文件</span>
+              <input id="proxyFileVisible" type="text" placeholder="proxies.txt" />
+            </label>
+            <label>
+              <span class="field-title">失败换出口次数</span>
+              <input id="proxyRetriesVisible" type="number" min="0" max="20" />
+            </label>
+            <label>
+              <span class="field-title">上游父代理</span>
+              <input id="proxyParentVisible" type="text" />
+            </label>
+            <label>
+              <span class="field-title">本地转发端口</span>
+              <input id="localProxyPortVisible" type="number" min="1" max="65535" />
+            </label>
+            <label class="check">
+              <input type="checkbox" id="proxyRandomVisible" />
+              <span class="field-title">代理池随机</span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="proxyRotateVisible" />
+              <span class="field-title">轮换 session</span>
+            </label>
+            <label>
+              <span class="field-title">mihomo 二进制</span>
+              <input id="embeddedBinaryVisible" type="text" placeholder="/usr/bin/verge-mihomo" />
+            </label>
+            <label>
+              <span class="field-title">监听地址</span>
+              <input id="embeddedListenVisible" type="text" placeholder="127.0.0.1" />
+            </label>
+            <label>
+              <span class="field-title">起始端口</span>
+              <input id="embeddedBasePortVisible" type="number" min="1024" max="65000" />
+            </label>
+            <label>
+              <span class="field-title">最大节点数</span>
+              <input id="embeddedMaxNodesVisible" type="number" min="0" max="10000" />
+            </label>
+            <label>
+              <span class="field-title">探测主机</span>
+              <input id="embeddedProbeHostVisible" type="text" />
+            </label>
+            <label>
+              <span class="field-title">探测端口</span>
+              <input id="embeddedProbePortVisible" type="number" min="1" max="65535" />
+            </label>
+            <label>
+              <span class="field-title">探测超时(秒)</span>
+              <input id="embeddedProbeTimeoutVisible" type="number" min="0.5" max="60" step="0.5" />
+            </label>
+            <label>
+              <span class="field-title">订阅本地 HTTP 回退</span>
+              <input id="subLocalHttpVisible" type="text" placeholder="http://127.0.0.1:7890" />
+            </label>
+          </div>
+          <p class="muted">这里的改动会同步到隐藏字段；点顶部「保存配置」才落盘。</p>
+        </details>
+      </section>
+    </form>
+  </main>
+  <script src="/static/config.js?v=egress6-1"></script>
+</body>
+</html>

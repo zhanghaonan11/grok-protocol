@@ -191,5 +191,51 @@ class TurnstileBrokerTests(unittest.TestCase):
         self.assertEqual(result.extras["lease_id"], "lease-1")
 
 
+
+    def test_lease_with_zero_reported_length_is_rejected(self):
+        class LeaseOnlyBroker:
+            @staticmethod
+            def solve_sync(_request, _solver):
+                return SolveResult(
+                    token="",
+                    provider="local",
+                    received_at=time.monotonic(),
+                    elapsed_ms=1,
+                    extras={
+                        "broker_url": "http://127.0.0.1:8010",
+                        "lease_id": "lease-zero",
+                        "token_length": 0,
+                    },
+                )
+
+        with self.assertRaises(flow.VerificationRequiredError):
+            flow.solve_turnstile_result(
+                sitekey="sitekey",
+                provider="local",
+                broker=LeaseOnlyBroker(),
+            )
+
+    def test_lease_without_token_length_is_rejected(self):
+        class LeaseOnlyBroker:
+            @staticmethod
+            def solve_sync(_request, _solver):
+                return SolveResult(
+                    token="",
+                    provider="local",
+                    received_at=time.monotonic(),
+                    elapsed_ms=1,
+                    extras={
+                        "broker_url": "http://127.0.0.1:8010",
+                        "lease_id": "lease-missing-len",
+                    },
+                )
+
+        with self.assertRaises(flow.VerificationRequiredError):
+            flow.solve_turnstile_result(
+                sitekey="sitekey",
+                provider="local",
+                broker=LeaseOnlyBroker(),
+            )
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import signal
 import re
 import shutil
 import subprocess
@@ -83,6 +84,158 @@ def _require_browser_version(browser_path: str, expected_major: int) -> str:
             f"expected={expected}, actual={actual_major}, full_version={version}"
         )
     return version
+
+
+def _browser_pid(browser) -> int:
+    """Best-effort extract Chromium root pid from DrissionPage browser object."""
+    if browser is None:
+        return 0
+    for name in ("process_id", "pid", "_process_id"):
+        value = getattr(browser, name, 0)
+        try:
+            value = value() if callable(value) else value
+            pid = int(value or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 1:
+            return pid
+    # Some wrappers keep a Popen/process object.
+    for name in ("process", "_process", "browser_process"):
+        proc = getattr(browser, name, None)
+        if proc is None:
+            continue
+        try:
+            pid = int(getattr(proc, "pid", 0) or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 1:
+            return pid
+    return 0
+
+
+def _reap_zombie_children() -> int:
+    """Reap any already-dead direct children of this process (non-blocking).
+
+    Chrome launched via DrissionPage is often a direct child of turnstile_solver.
+    If quit()/kill races, those children become zombies until the parent wait()s.
+    """
+    if os.name == "nt":
+        return 0
+    reaped = 0
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        except OSError:
+            break
+        if pid <= 0:
+            break
+        reaped += 1
+    return reaped
+
+
+_SIGCHLD_REAPER_INSTALLED = False
+
+
+def _install_sigchld_reaper() -> None:
+    """Install a non-blocking SIGCHLD handler so exited chrome children are reaped promptly."""
+    global _SIGCHLD_REAPER_INSTALLED
+    if _SIGCHLD_REAPER_INSTALLED or os.name == "nt":
+        return
+    try:
+        def _handler(signum, frame):  # noqa: ARG001
+            try:
+                _reap_zombie_children()
+            except Exception:
+                pass
+
+        signal.signal(signal.SIGCHLD, _handler)
+        _SIGCHLD_REAPER_INSTALLED = True
+    except Exception:
+        # Some environments disallow custom SIGCHLD handlers; periodic reap still works.
+        pass
+
+
+def _reap_chrome_process_tree(pid: int, *, timeout_sec: float = 2.0) -> None:
+    """Terminate a Chrome process tree and wait so children do not become zombies.
+
+    Parent solvers historically called browser.quit() without waiting long enough,
+    leaving dozens of `[chrome] <defunct>` entries under turnstile_solver.
+    """
+    pid = int(pid or 0)
+    if pid <= 1:
+        return
+    try:
+        import psutil
+    except Exception:
+        # Fallback: best-effort kill/wait without psutil.
+        try:
+            import os
+            import signal
+            import time as _time
+
+            os.kill(pid, signal.SIGTERM)
+            deadline = _time.time() + max(0.2, float(timeout_sec))
+            while _time.time() < deadline:
+                try:
+                    waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    return
+                if waited_pid == pid:
+                    return
+                _time.sleep(0.05)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        except Exception:
+            return
+        return
+
+    try:
+        root = psutil.Process(pid)
+    except (psutil.Error, OSError):
+        return
+    procs = []
+    try:
+        procs = root.children(recursive=True)
+    except (psutil.Error, OSError):
+        procs = []
+    procs.append(root)
+    # Graceful first.
+    for proc in procs:
+        try:
+            proc.terminate()
+        except (psutil.Error, OSError):
+            pass
+    try:
+        psutil.wait_procs(procs, timeout=max(0.2, float(timeout_sec)))
+    except Exception:
+        pass
+    # Force remaining.
+    survivors = []
+    for proc in procs:
+        try:
+            if proc.is_running():
+                proc.kill()
+                survivors.append(proc)
+        except (psutil.Error, OSError):
+            pass
+    if survivors:
+        try:
+            psutil.wait_procs(survivors, timeout=max(0.2, float(timeout_sec)))
+        except Exception:
+            pass
+    # Always drain any direct zombie children left behind by Chrome.
+    try:
+        _reap_zombie_children()
+    except Exception:
+        pass
 
 
 @dataclass(frozen=True)
@@ -193,6 +346,9 @@ class BrowserSlot:
         self._seen_context_ids: set[str] = set()
         self._dispose_attempted_context_ids: set[str] = set()
         self._closed = False
+        self._virtual_display = None
+        self._browser_mode = "headed"
+        self._launch_display = ""
 
     @staticmethod
     def _run_browser_cdp(browser, method: str, **params):
@@ -310,6 +466,58 @@ class BrowserSlot:
             extras["browser_context_cleanup_error"] = cleanup_error
         result.extras = extras
 
+
+    def _resolve_launch_headless(self) -> bool:
+        """Map requested headless affinity to an actual Chrome launch mode.
+
+        accounts.x.ai consistently hard-blocks pure headless Chrome. When the
+        caller asks for headless, prefer Xvfb virtual-headed (or real headed if
+        a display exists) so local Turnstile capture stays viable.
+        """
+        want_headless = bool(self.affinity.headless)
+        if not want_headless:
+            self._browser_mode = "headed"
+            self._launch_display = str(os.environ.get("DISPLAY") or "")
+            return False
+        try:
+            from xai_http_flow import (
+                _resolve_local_browser_mode,
+                _VirtualDisplaySession,
+            )
+        except Exception:
+            self._browser_mode = "headless-new"
+            self._launch_display = str(os.environ.get("DISPLAY") or "")
+            return True
+
+        mode, use_headless = _resolve_local_browser_mode(want_headless=True)
+        if mode == "virtual-headed":
+            virtual = _VirtualDisplaySession(log_callback=self.worker.log_callback)
+            if virtual.start():
+                self._virtual_display = virtual
+                self._browser_mode = "virtual-headed"
+                self._launch_display = str(os.environ.get("DISPLAY") or "")
+                return False
+            self._browser_mode = "headless-new"
+            self._launch_display = str(os.environ.get("DISPLAY") or "")
+            return True
+        if mode == "headed":
+            self._browser_mode = "headed-fallback"
+            self._launch_display = str(os.environ.get("DISPLAY") or "")
+            return False
+        self._browser_mode = "headless-new"
+        self._launch_display = str(os.environ.get("DISPLAY") or "")
+        return bool(use_headless)
+
+    def _stop_virtual_display(self) -> None:
+        virtual = self._virtual_display
+        self._virtual_display = None
+        if virtual is None:
+            return
+        try:
+            virtual.stop()
+        except Exception:
+            pass
+
     def start(self) -> None:
         if self.browser is not None:
             return
@@ -354,11 +562,22 @@ class BrowserSlot:
                 if not callable(set_browser_path):
                     raise RuntimeError("当前 ChromiumOptions 不支持 set_browser_path")
                 set_browser_path(self.affinity.browser_path)
+            use_headless = self._resolve_launch_headless()
+            try:
+                from xai_http_flow import _log as _ts_log
+            except Exception:
+                _ts_log = None
+            if _ts_log is not None:
+                _ts_log(
+                    self.worker.log_callback,
+                    f"[Turnstile] 浏览器池启动 mode={self._browser_mode} "
+                    f"headless={use_headless} display={self._launch_display or '-'}",
+                )
             if build_options is not None:
                 options = build_options(
                     options=options,
                     proxy=self.browser_proxy,
-                    headless=self.affinity.headless,
+                    headless=bool(use_headless),
                     user_agent=self.user_agent,
                     log_callback=self.worker.log_callback,
                 )
@@ -367,7 +586,7 @@ class BrowserSlot:
                     options.auto_port()
                 except Exception:
                     pass
-                if self.affinity.headless:
+                if use_headless:
                     options.headless(True)
                 if self.user_agent:
                     options.set_user_agent(self.user_agent)
@@ -419,6 +638,7 @@ class BrowserSlot:
             self.created_monotonic = time.monotonic()
             self.last_used_monotonic = self.created_monotonic
         except Exception:
+            self._stop_virtual_display()
             self.close()
             raise
 
@@ -541,11 +761,22 @@ class BrowserSlot:
             return
         self._closed = True
         browser, self.browser = self.browser, None
+        browser_pid = _browser_pid(browser)
         if browser is not None:
             try:
                 browser.quit()
             except Exception:
                 pass
+        # Always reap the process tree. quit() alone can leave zombie chrome under
+        # long-lived turnstile_solver parents.
+        try:
+            _reap_chrome_process_tree(browser_pid, timeout_sec=2.0)
+        except Exception:
+            pass
+        try:
+            _reap_zombie_children()
+        except Exception:
+            pass
         stop_browser_proxy(self.forwarder_instance)
         self.forwarder_instance = ""
         if self.profile_dir:
@@ -553,6 +784,7 @@ class BrowserSlot:
                 shutil.rmtree(Path(self.profile_dir), ignore_errors=True)
             except Exception:
                 pass
+        self._stop_virtual_display()
 
 
 class PersistentBrowserPool:
@@ -577,6 +809,10 @@ class PersistentBrowserPool:
             if self._started:
                 return
             self._started = True
+            try:
+                _install_sigchld_reaper()
+            except Exception:
+                pass
             thread = threading.Thread(
                 target=self._maintenance_loop,
                 name="turnstile-browser-pool-maintenance",
@@ -588,6 +824,10 @@ class PersistentBrowserPool:
     def _maintenance_loop(self) -> None:
         interval = max(0.05, float(self.config.browser_maintenance_interval_sec or 5.0))
         while not self._maintenance_stop.wait(interval):
+            try:
+                _reap_zombie_children()
+            except Exception:
+                pass
             self._reap_idle_slots()
 
     def _reap_idle_slots(self) -> int:
@@ -824,3 +1064,7 @@ class PersistentBrowserPool:
             ))
         for slot in slots:
             slot.close()
+        try:
+            _reap_zombie_children()
+        except Exception:
+            pass

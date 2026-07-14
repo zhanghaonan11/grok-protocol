@@ -101,13 +101,17 @@ class WebUIAppTests(unittest.TestCase):
             self.assertIn("运行台", page.text)
             self.assertIn("凭证列表", page.text)
             self.assertIn('href="/credentials"', page.text)
-            self.assertIn('name="local_turnstile_max_workers"', page.text)
-            self.assertIn('name="submit_workers"', page.text)
-            self.assertIn('name="yyds_create_spacing_sec"', page.text)
-            self.assertIn('class="help-tip"', page.text)
-            self.assertIn('data-tip="选临时邮箱服务商，决定用哪套邮箱配置"', page.text)
-            self.assertIn('data-tip="仅 local 生效；总并发仍受运行台与 32 上限约束"', page.text)
-            self.assertGreaterEqual(page.text.count('class="help-tip"'), 23)
+            self.assertIn('href="/config/mail"', page.text)
+            self.assertIn('href="/config/proxy"', page.text)
+            mail = client.get("/config/mail")
+            self.assertEqual(mail.status_code, 200)
+            self.assertIn('name="local_turnstile_max_workers"', mail.text)
+            self.assertIn('name="submit_workers"', mail.text)
+            self.assertIn('name="yyds_create_spacing_sec"', mail.text)
+            self.assertIn('class="help-tip"', mail.text)
+            self.assertIn('data-tip="选临时邮箱服务商，决定用哪套邮箱配置"', mail.text)
+            self.assertIn('data-tip="仅 local 生效；总并发仍受运行台与 128 上限约束"', mail.text)
+            self.assertGreaterEqual(mail.text.count('class="help-tip"'), 10)
             data = client.get("/api/config-center")
             self.assertEqual(data.status_code, 200)
             body = data.json()
@@ -145,8 +149,11 @@ class WebUIAppTests(unittest.TestCase):
                 r = client.post("/api/proxy-pool/test", json={"count": 5, "text": "1.1.1.1:80:u:p\n"})
             self.assertEqual(r.status_code, 200)
             self.assertEqual(r.json()["ok"], 1)
-            page = client.get("/config")
-            self.assertIn("随机测试5条", page.text)
+            page = client.get("/config/proxy")
+            self.assertTrue(
+                ("随机测试" in page.text) or ("测试注册代理池" in page.text),
+                page.text[:500],
+            )
 
     def test_embedded_proxy_status_and_reload_guard(self):
         with tempfile.TemporaryDirectory() as d:
@@ -206,14 +213,38 @@ class WebUIAppTests(unittest.TestCase):
             service = self._service(root)
             app = webui_app.create_app(service=service)
             client = TestClient(app)
-            page = client.get("/config")
+            page = client.get("/config/proxy")
             self.assertEqual(page.status_code, 200)
             self.assertIn("embedded_proxy_enabled", page.text)
             self.assertIn("btnEmbeddedProbe", page.text)
-            self.assertIn("内嵌代理内核", page.text)
+            self.assertIn("内嵌", page.text)
             self.assertIn("embedded_proxy_base_port", page.text)
             self.assertIn("btnEmbeddedStart", page.text)
+            self.assertIn("btnEmbeddedFetchSub", page.text)
+            self.assertIn("proxy_subscription_urls", page.text)
             self.assertIn("btnEmbeddedStatus", page.text)
+
+    def test_embedded_proxy_fetch_subscription_api(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            service = self._service(root)
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+            payload = {
+                "cached_vless_count": 2,
+                "message": "ok",
+                "urls": ["https://example.test/sub"],
+            }
+            with mock.patch.object(
+                service, "fetch_embedded_subscription_nodes", return_value=payload
+            ) as fetch:
+                r = client.post(
+                    "/api/embedded-proxy/fetch-subscription",
+                    json={"proxy_subscription_urls": "https://example.test/sub"},
+                )
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["cached_vless_count"], 2)
+            fetch.assert_called_once()
 
     def test_embedded_proxy_autostart_on_app_boot(self):
         with tempfile.TemporaryDirectory() as d:

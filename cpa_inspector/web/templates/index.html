@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ app_title }}</title>
+  <link rel="icon" href="/static/cpa/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/static/cpa/favicon.ico" sizes="any" />
+  <link rel="icon" href="/static/cpa/favicon-32.png" type="image/png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="/static/cpa/apple-touch-icon.png" sizes="180x180" />
+  <link rel="stylesheet" href="/static/cpa/app.css?v=20260712-nav1" />
+  <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+</head>
+<body class="app-shell">
+  <header class="topbar">
+    <div class="brand">
+      <div>
+        <strong>{{ app_title }}</strong>
+        <span class="subtitle">{{ app_subtitle }}</span>
+      </div>
+      <nav class="main-nav" aria-label="主导航">
+        <a href="/">运行台</a>
+        <a href="/config">配置中心</a>
+        <a href="/credentials">凭证列表</a>
+        <a href="/cpa" class="active" aria-current="page">CPA 巡检</a>
+      </nav>
+    </div>
+    <div class="topbar-actions">
+      <button type="button" id="btn-open-job-workbench-top" class="btn sm">任务台</button>
+      <div id="connection-status" class="status-pill status-off" data-connected="0">未连接</div>
+    </div>
+  </header>
+
+  <section class="panel connect-panel" aria-label="连接与设置">
+    <div class="row wrap">
+      <label class="field">
+        <span>配置名</span>
+        <input id="profile-name" type="text" value="default" autocomplete="off" />
+      </label>
+      <label class="field grow">
+        <span>Base URL</span>
+        <input id="base-url" type="url" placeholder="http://127.0.0.1:8317" autocomplete="off" />
+      </label>
+      <label class="field grow">
+        <span>管理密钥</span>
+        <input id="secret-key" type="password" placeholder="secret_key" autocomplete="off" />
+      </label>
+      <label class="field">
+        <span>已存配置</span>
+        <select id="profile-select">
+          <option value="">选择配置…</option>
+        </select>
+      </label>
+      <div class="btn-row">
+        <button type="button" id="btn-connect" class="btn primary">连接</button>
+        <button type="button" id="btn-save-profile" class="btn">保存配置</button>
+      </div>
+    </div>
+    <div class="row wrap settings-row">
+      <label class="field">
+        <span>并发</span>
+        <input id="setting-workers" type="number" min="1" max="32" value="4" />
+      </label>
+      <label class="field">
+        <span>默认每页</span>
+        <select id="setting-page-size">
+          <option value="20">20</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>探测模型</span>
+        <input id="setting-probe-model" type="text" value="gpt-5" />
+      </label>
+      <label class="field">
+        <span>探测超时(s)</span>
+        <input id="setting-probe-timeout" type="number" min="1" value="15" />
+      </label>
+      <label class="field">
+        <span>探测并发</span>
+        <input
+          id="setting-probe-workers"
+          type="number"
+          min="0"
+          max="32"
+          value="0"
+          title="0=跟随全局并发"
+        />
+      </label>
+      <label class="field checkbox-field">
+        <span>导入时刷新 token</span>
+        <input id="setting-import-refresh" type="checkbox" checked />
+      </label>
+      <label class="field">
+        <span>刷新超时(s)</span>
+        <input id="setting-import-refresh-timeout" type="number" min="1" value="20" />
+      </label>
+      <div class="btn-row">
+        <button type="button" id="btn-save-settings" class="btn">保存设置</button>
+      </div>
+    </div>
+    <div id="connect-message" class="message" hidden></div>
+  </section>
+
+  <section class="panel toolbar" aria-label="工具条">
+    <div class="btn-row wrap">
+      <button type="button" id="btn-refresh" class="btn" disabled>刷新</button>
+      <button type="button" id="btn-import" class="btn" disabled>导入文件</button>
+      <button type="button" id="btn-import-path" class="btn" disabled>本地路径导入</button>
+      <button type="button" id="btn-import-paste" class="btn" disabled>粘贴导入</button>
+      <button type="button" id="btn-export" class="btn" disabled>导出</button>
+      <button type="button" id="btn-export-delete" class="btn danger" disabled>导出并删除</button>
+      <div class="btn-group">
+        <button type="button" id="btn-health" class="btn" disabled title="探测已勾选凭证">健康探测</button>
+        <button type="button" id="btn-health-page" class="btn" disabled title="探测当前页全部凭证">探测本页</button>
+        <button type="button" id="btn-health-filtered" class="btn" disabled title="探测当前筛选条件下的全部凭证">探测筛选结果</button>
+        <button type="button" id="btn-health-all" class="btn" disabled title="遍历号池全部凭证">探测全部</button>
+      </div>
+      <label class="field inline-field" title="本次探测并发，0=跟随设置">
+        <span>本次并发</span>
+        <input id="probe-workers-once" type="number" min="0" max="32" value="0" />
+      </label>
+      <span id="selection-summary" class="muted">已选 0</span>
+      <input id="import-file" type="file" accept=".json,application/json" multiple hidden />
+    </div>
+  </section>
+
+  <section class="panel filters" aria-label="筛选">
+    <div class="row wrap">
+      <label class="field grow">
+        <span>关键词</span>
+        <input id="filter-search" type="search" placeholder="名称 / 邮箱 / 账号 / 备注" />
+      </label>
+      <label class="field">
+        <span>状态</span>
+        <select id="filter-status">
+          <option value="全部">全部</option>
+          <option value="活跃">活跃</option>
+          <option value="已停用">已停用</option>
+          <option value="暂不可用">暂不可用</option>
+          <option value="未知">未知</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Provider</span>
+        <select id="filter-provider">
+          <option value="全部">全部</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>可导出</span>
+        <select id="filter-exportable">
+          <option value="全部">全部</option>
+          <option value="仅可导出">仅可导出</option>
+          <option value="仅不可导出">仅不可导出</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>健康</span>
+        <select id="filter-health">
+          <option value="全部">全部</option>
+          <option value="未测">未测</option>
+          <option value="健康">健康</option>
+          <option value="失败">失败</option>
+          <option value="不确定">不确定</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>每页</span>
+        <select id="filter-page-size">
+          <option value="20">20</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+        </select>
+      </label>
+    </div>
+  </section>
+
+  <main class="main-grid">
+    <section class="panel table-panel" aria-label="凭证列表">
+      <div class="table-meta">
+        <span id="list-summary" class="muted">未加载</span>
+      </div>
+      <div class="table-wrap">
+        <table id="credentials-table">
+          <thead>
+            <tr>
+              <th class="col-check"><input type="checkbox" id="check-all" title="全选当前页" /></th>
+              <th>名称</th>
+              <th>Provider</th>
+              <th>状态</th>
+              <th>邮箱</th>
+              <th>可导出</th>
+              <th>健康</th>
+              <th>更新时间</th>
+              <th>上次刷新</th>
+            </tr>
+          </thead>
+          <tbody id="credentials-body">
+            <tr class="empty-row"><td colspan="9">连接后显示凭证列表</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="pagination" class="pagination">
+        <button type="button" id="page-prev" class="btn sm" disabled>上一页</button>
+        <span id="page-info" class="muted">第 0 / 0 页</span>
+        <button type="button" id="page-next" class="btn sm" disabled>下一页</button>
+      </div>
+    </section>
+
+    <aside id="detail-panel" class="panel detail-panel" aria-label="详情">
+      <h2>详情</h2>
+      <div id="detail-empty" class="muted">点击表格行查看脱敏详情</div>
+      <dl id="detail-content" class="detail-list" hidden></dl>
+    </aside>
+  </main>
+
+  <section id="job-panel" class="panel job-panel" aria-label="任务区">
+    <div class="job-header">
+      <h2>任务区</h2>
+      <div class="btn-row">
+        <span id="job-status" class="muted">空闲</span>
+        <button type="button" id="btn-open-job-workbench" class="btn sm primary">打开任务台</button>
+      </div>
+    </div>
+    <div class="progress-wrap">
+      <div id="job-progress-bar" class="progress-bar" style="width:0%"></div>
+    </div>
+    <div id="job-message" class="muted">尚无批量任务</div>
+    <div class="job-dock-actions">
+      <span class="muted job-mini-hint">完整筛选、错误详情和删除在独立任务台中处理</span>
+      <button type="button" id="btn-open-job-workbench-2" class="btn primary">进入独立任务台</button>
+    </div>
+  </section>
+
+  <div id="job-workbench-modal" class="modal" hidden>
+    <div class="modal-card modal-card-job">
+      <div class="modal-header">
+        <h2>任务台</h2>
+        <button type="button" id="job-workbench-close" class="btn sm">关闭</button>
+      </div>
+      <div class="modal-body job-workbench-body">
+        <div class="job-workbench-summary">
+          <div class="job-header">
+            <div>
+              <div class="muted">状态</div>
+              <div id="job-wb-status">空闲</div>
+            </div>
+            <div>
+              <div class="muted">进度</div>
+              <div id="job-wb-progress">0 / 0</div>
+            </div>
+            <div class="grow">
+              <div class="muted">消息</div>
+              <div id="job-wb-message" class="job-wb-message">尚无批量任务</div>
+            </div>
+          </div>
+          <div class="progress-wrap">
+            <div id="job-wb-progress-bar" class="progress-bar" style="width:0%"></div>
+          </div>
+        </div>
+
+        <div class="row wrap job-workbench-filters">
+          <label class="field grow">
+            <span>关键词（名称/详情）</span>
+            <input id="job-filter-text" type="search" placeholder="如 invalid_grant / spending-limit / 凭证无效" />
+          </label>
+          <label class="field">
+            <span>结果</span>
+            <select id="job-filter-result">
+              <option value="全部">全部</option>
+              <option value="失败">失败</option>
+              <option value="成功">成功</option>
+              <option value="不确定">不确定</option>
+              <option value="跳过">跳过</option>
+              <option value="部分成功">部分成功</option>
+            </select>
+          </label>
+          <label class="field checkbox-field">
+            <span>仅失败/不确定</span>
+            <input id="job-filter-bad-only" type="checkbox" />
+          </label>
+          <div class="btn-row">
+            <button type="button" id="btn-job-select-filtered" class="btn">全选筛选结果</button>
+            <button type="button" id="btn-job-clear-selected" class="btn">清空选择</button>
+            <button type="button" id="btn-job-delete-selected" class="btn danger">删除选中线上凭证</button>
+          </div>
+        </div>
+        <div id="job-filter-summary" class="muted">共 0 条结果</div>
+
+        <div class="job-auto-panel">
+          <div class="job-header">
+            <h3 class="job-auto-title">自动巡检删除</h3>
+            <span id="auto-cleanup-status" class="muted">未运行</span>
+          </div>
+          <div class="row wrap job-auto-filters">
+            <label class="field">
+              <span>探测范围</span>
+              <select id="auto-cleanup-scope">
+                <option value="all">全部凭证</option>
+                <option value="filtered">当前筛选结果</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>匹配结果</span>
+              <select id="auto-cleanup-match">
+                <option value="failed">仅失败</option>
+                <option value="failed_uncertain">失败 + 不确定</option>
+              </select>
+            </label>
+            <label class="field grow">
+              <span>关键词规则（逗号分隔，命中任一）</span>
+              <input
+                id="auto-cleanup-keyword"
+                type="text"
+                value="invalid_grant,revoked,bad-credentials,凭证无效"
+                placeholder="invalid_grant,revoked,bad-credentials"
+              />
+            </label>
+            <label class="field">
+              <span>轮间隔(s)</span>
+              <input id="auto-cleanup-interval" type="number" min="0" value="0" title="0=本轮结束后立即下一轮" />
+            </label>
+            <label class="field">
+              <span>最大轮次</span>
+              <input id="auto-cleanup-max-rounds" type="number" min="0" value="0" title="0=不限，直到无匹配" />
+            </label>
+            <div class="btn-row">
+              <button type="button" id="btn-auto-cleanup-save" class="btn">保存规则</button>
+              <button type="button" id="btn-auto-cleanup-start" class="btn primary">开始自动巡检</button>
+              <button type="button" id="btn-auto-cleanup-stop" class="btn danger" disabled>停止</button>
+            </div>
+          </div>
+          <div id="auto-cleanup-log" class="muted">流程：探测 → 按规则筛选 → 删除命中项 → 循环</div>
+        </div>
+
+        <div class="table-wrap job-workbench-table-wrap">
+          <table id="job-results-table">
+            <thead>
+              <tr>
+                <th class="col-check"><input type="checkbox" id="job-check-all" title="全选当前筛选" /></th>
+                <th>名称</th>
+                <th>结果</th>
+                <th>详情</th>
+              </tr>
+            </thead>
+            <tbody id="job-results-body">
+              <tr class="empty-row"><td colspan="4">任务结果会显示在这里</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <span id="job-selected-summary" class="muted">已选 0</span>
+        <div class="btn-row">
+          <button type="button" id="btn-job-workbench-close" class="btn">关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="import-modal" class="modal" hidden>
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>导入预检</h2>
+        <button type="button" id="import-modal-close" class="btn sm">关闭</button>
+      </div>
+      <div class="table-wrap modal-body">
+        <table id="import-preview-table">
+          <thead>
+            <tr>
+              <th>源文件</th>
+              <th>目标名</th>
+              <th>Provider</th>
+              <th>邮箱</th>
+              <th>有效</th>
+              <th>重复</th>
+              <th>动作</th>
+              <th>摘要</th>
+            </tr>
+          </thead>
+          <tbody id="import-preview-body"></tbody>
+        </table>
+      </div>
+      <div class="modal-footer">
+        <span id="import-preview-summary" class="muted"></span>
+        <div class="btn-row">
+          <button type="button" id="btn-import-cancel" class="btn">取消</button>
+          <button type="button" id="btn-import-execute" class="btn primary">确认导入</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="paste-import-modal" class="modal" hidden>
+    <div class="modal-card modal-card-sm">
+      <div class="modal-header">
+        <h2>粘贴导入</h2>
+        <button type="button" id="paste-import-close" class="btn sm">关闭</button>
+      </div>
+      <div class="modal-body paste-import-body">
+        <p class="muted paste-hint">
+          支持 XAI 凭证 JSON，或 <code>JSON____SSO</code> / <code>JSON----SSO</code> 组合文本。
+          系统会自动识别 JSON 并忽略尾部 SSO，可一次粘贴多条。
+        </p>
+        <label class="field block">
+          <span>凭证文本</span>
+          <textarea
+            id="paste-import-text"
+            rows="12"
+            spellcheck="false"
+            placeholder='{"type":"xai","access_token":"...","email":"..."}____eyJ...'
+          ></textarea>
+        </label>
+      </div>
+      <div class="modal-footer">
+        <span class="muted">识别后进入预检</span>
+        <div class="btn-row">
+          <button type="button" id="btn-paste-import-cancel" class="btn">取消</button>
+          <button type="button" id="btn-paste-import-preview" class="btn primary">识别并预检</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="path-import-modal" class="modal" hidden>
+    <div class="modal-card modal-card-sm">
+      <div class="modal-header">
+        <h2>本地路径导入</h2>
+        <button type="button" id="path-import-close" class="btn sm">关闭</button>
+      </div>
+      <div class="modal-body path-import-body">
+        <p class="muted paste-hint">
+          填写本机服务器上的绝对路径（单文件或目录），也可把凭证文件拖进下方区域。
+          目录会递归收集 <code>*.json</code>。
+        </p>
+        <label class="field block">
+          <span>本机路径</span>
+          <div class="path-input-row">
+            <input
+              id="path-import-input"
+              type="text"
+              spellcheck="false"
+              placeholder="/home/user/xai_credentials 或 /path/to/xai-user.json"
+              autocomplete="off"
+            />
+            <button type="button" id="btn-path-browse" class="btn">选择文件</button>
+          </div>
+        </label>
+        <div
+          id="path-dropzone"
+          class="path-dropzone"
+          tabindex="0"
+          role="button"
+          aria-label="拖放凭证文件到此处"
+        >
+          <div class="path-dropzone-title">拖放 .json 凭证到这里</div>
+          <div class="muted">支持多文件；也可点击选择</div>
+          <ul id="path-drop-list" class="path-drop-list" hidden></ul>
+        </div>
+        <input
+          id="path-import-file"
+          type="file"
+          accept=".json,application/json"
+          multiple
+          hidden
+        />
+      </div>
+      <div class="modal-footer">
+        <span id="path-import-status" class="muted">路径与拖放二选一即可</span>
+        <div class="btn-row">
+          <button type="button" id="btn-path-import-cancel" class="btn">取消</button>
+          <button type="button" id="btn-path-import-preview" class="btn primary">预检</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/static/cpa/app.js?v=20260712-nav1" defer></script>
+</body>
+</html>

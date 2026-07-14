@@ -1,0 +1,13 @@
+from __future__ import annotations
+
+APP_TITLE = "CPA Web 巡检台"
+APP_SUBTITLE = "CLIProxyAPI 本机凭证巡检工具"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8218
+REQUEST_TIMEOUT_SECONDS = 15
+MANAGEMENT_PREFIX = "/v0/management"
+AUTH_FILES_ENDPOINT = f"{MANAGEMENT_PREFIX}/auth-files"
+AUTH_FILES_DOWNLOAD_ENDPOINT = f"{AUTH_FILES_ENDPOINT}/download"
+API_CALL_ENDPOINT = f"{MANAGEMENT_PREFIX}/api-call"
+CHAT_COMPLETIONS_ENDPOINT = "/v1/chat/completions"
+CONFIG_DIR_NAME = "cpa_web_inspector"

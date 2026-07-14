@@ -1377,16 +1377,23 @@ def _validate_local_fingerprint(
         )
     expected_primary = str(expected_language or "").split(",", 1)[0].split(";", 1)[0].strip().lower()
     observed_primary = str(observed_language or "").strip().lower()
-    if expected_primary and observed_primary != expected_primary:
+    # Only compare when the browser actually reported a value. Some headless /
+    # virtual-headed sessions transiently return empty language/platform fields.
+    if expected_primary and observed_primary and observed_primary != expected_primary:
         raise VerificationRequiredError(
             "local Turnstile 浏览器语言与 HTTP 会话指纹不一致"
         )
-    if str(expected_platform or "").strip() and str(observed_platform or "").strip() != str(expected_platform).strip():
+    if (
+        str(expected_platform or "").strip()
+        and str(observed_platform or "").strip()
+        and str(observed_platform or "").strip() != str(expected_platform).strip()
+    ):
         raise VerificationRequiredError(
             "local Turnstile navigator.platform 与 HTTP 会话指纹不一致"
         )
     if (
         str(expected_client_hint_platform or "").strip()
+        and str(observed_client_hint_platform or "").strip()
         and str(observed_client_hint_platform or "").strip()
         != str(expected_client_hint_platform).strip()
     ):
@@ -1395,6 +1402,7 @@ def _validate_local_fingerprint(
         )
     if (
         str(expected_browser_major or "").strip()
+        and str(observed_browser_major or "").strip()
         and str(observed_browser_major or "").strip()
         != str(expected_browser_major).strip()
     ):
@@ -2631,11 +2639,11 @@ class CloudflareTempMailbox:
         email: str,
         token: str,
         *,
-        timeout: int = 180,
-        poll_interval: int = 3,
+        timeout: int = 45,
+        poll_interval: int = 2,
         received_after_epoch: float = 0.0,
     ) -> str:
-        deadline = time.monotonic() + max(5, int(timeout or 180))
+        deadline = time.monotonic() + max(5, int(timeout or 45))
         attempts: Dict[str, int] = {}
         while time.monotonic() < deadline:
             try:
@@ -2658,7 +2666,162 @@ class CloudflareTempMailbox:
 
 
 
+# Cross-process local Turnstile browser limiter.
+# Each register worker is a separate process; without this, 4 workers open 4
+# Chrome+Xvfb at once and thrash each other (disconnect / empty timeout).
+_LOCAL_TURNSTILE_LOCK_PATH = Path(
+    os.environ.get("XAI_LOCAL_TURNSTILE_LOCK_PATH")
+    or (Path(tempfile.gettempdir()) / "xai-local-turnstile.lock")
+)
+_LOCAL_TURNSTILE_SLOT_DIR = Path(
+    os.environ.get("XAI_LOCAL_TURNSTILE_SLOT_DIR")
+    or (Path(tempfile.gettempdir()) / "xai-local-turnstile-slots")
+)
+DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT = 2
+MIN_LOCAL_TURNSTILE_MAX_INFLIGHT = 1
+MAX_LOCAL_TURNSTILE_MAX_INFLIGHT = 12
+
+
+def _load_turnstile_inflight_config_fallback() -> Dict[str, Any]:
+    """Best-effort read of project config.json for cross-process slot limits."""
+    candidates = []
+    env_cfg = str(os.environ.get("XAI_CONFIG_PATH") or os.environ.get("XAI_MAIL_CONFIG") or "").strip()
+    if env_cfg:
+        candidates.append(Path(env_cfg))
+    # common: cwd/config.json next to running register worker
+    candidates.append(Path.cwd() / "config.json")
+    here = Path(__file__).resolve().parent
+    candidates.append(here / "config.json")
+    for path in candidates:
+        try:
+            if path.is_file():
+                import json
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            continue
+    return {}
+
+
+def resolve_local_turnstile_max_inflight(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    strict: bool = False,
+) -> int:
+    """Max concurrent local Chrome Turnstile captures across all processes.
+
+    Priority:
+      1) env XAI_LOCAL_TURNSTILE_MAX_INFLIGHT
+      2) config.local_turnstile_max_inflight
+      3) config.local_turnstile_max_workers (legacy alias)
+      4) default 2
+    """
+    env_raw = str(os.environ.get("XAI_LOCAL_TURNSTILE_MAX_INFLIGHT") or "").strip()
+    cfg = config if isinstance(config, dict) else None
+    if cfg is None:
+        cfg = _load_turnstile_inflight_config_fallback()
+    cfg_raw = None
+    if isinstance(cfg, dict):
+        if "local_turnstile_max_inflight" in cfg and str(cfg.get("local_turnstile_max_inflight") or "").strip() != "":
+            cfg_raw = cfg.get("local_turnstile_max_inflight")
+        elif "local_turnstile_max_workers" in cfg and str(cfg.get("local_turnstile_max_workers") or "").strip() != "":
+            # legacy key: treat as desired inflight when dedicated key missing
+            cfg_raw = cfg.get("local_turnstile_max_workers")
+    raw = env_raw if env_raw != "" else ("" if cfg_raw is None else str(cfg_raw).strip())
+    if raw == "":
+        return DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError) as exc:
+        if strict:
+            raise ValueError("local Turnstile 并发上限必须是整数") from exc
+        return DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT
+    if not (MIN_LOCAL_TURNSTILE_MAX_INFLIGHT <= value <= MAX_LOCAL_TURNSTILE_MAX_INFLIGHT):
+        if strict:
+            raise ValueError(
+                "local Turnstile 并发上限必须介于 "
+                f"{MIN_LOCAL_TURNSTILE_MAX_INFLIGHT} 到 {MAX_LOCAL_TURNSTILE_MAX_INFLIGHT}"
+            )
+        return max(
+            MIN_LOCAL_TURNSTILE_MAX_INFLIGHT,
+            min(MAX_LOCAL_TURNSTILE_MAX_INFLIGHT, value),
+        )
+    return value
+
+
+@contextmanager
+def _local_turnstile_slot(*, max_inflight: Optional[int] = None, log_callback: LogFn = None):
+    """Cross-process semaphore for local browser Turnstile captures."""
+    limit = int(max_inflight or 0)
+    if limit <= 0:
+        # env > config.json > default；不再无脑硬压回 2
+        limit = resolve_local_turnstile_max_inflight(strict=False)
+    limit = max(MIN_LOCAL_TURNSTILE_MAX_INFLIGHT, min(MAX_LOCAL_TURNSTILE_MAX_INFLIGHT, limit))
+
+    slot_dir = _LOCAL_TURNSTILE_SLOT_DIR
+    slot_dir.mkdir(parents=True, exist_ok=True)
+    gate_path = _LOCAL_TURNSTILE_LOCK_PATH
+    gate_path.parent.mkdir(parents=True, exist_ok=True)
+    gate = open(gate_path, "a+", encoding="utf-8")
+    handle = None
+    slot_idx = None
+    waited = False
+    started_wait = time.monotonic()
+    try:
+        while True:
+            fcntl.flock(gate.fileno(), fcntl.LOCK_EX)
+            try:
+                for i in range(limit):
+                    path_i = slot_dir / f"slot-{i}.lock"
+                    fh = open(path_i, "a+", encoding="utf-8")
+                    try:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
+                        continue
+                    handle = fh
+                    slot_idx = i
+                    break
+            finally:
+                fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
+            if handle is not None:
+                break
+            if not waited:
+                waited = True
+                _log(
+                    log_callback,
+                    f"[Turnstile] 本地求解排队中（全局限流 {limit} 路浏览器，避免 4 并发互挤）",
+                )
+            time.sleep(0.35)
+        wait_ms = int((time.monotonic() - started_wait) * 1000)
+        if waited:
+            _log(
+                log_callback,
+                f"[Turnstile] 获得本地求解槽位 slot={slot_idx}/{limit} wait_ms={wait_ms}",
+            )
+        yield {"slot": slot_idx, "limit": limit, "wait_ms": wait_ms}
+    finally:
+        if handle is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                handle.close()
+            except Exception:
+                pass
+        try:
+            gate.close()
+        except Exception:
+            pass
+
+
 # Cross-process YYDS account-create limiter.
+
 # Multi-worker TUI spawns one process per registration, so a pure threading.Lock
 # only serializes within a single process and still bursts the provider.
 _YYDS_CREATE_LOCK_PATH = Path(
@@ -3185,11 +3348,11 @@ class YydsTempMailbox:
         email: str,
         token: str,
         *,
-        timeout: int = 180,
-        poll_interval: int = 3,
+        timeout: int = 45,
+        poll_interval: int = 2,
         received_after_epoch: float = 0.0,
     ) -> str:
-        deadline = time.monotonic() + max(5, int(timeout or 180))
+        deadline = time.monotonic() + max(5, int(timeout or 45))
         seen: set = set()
         while time.monotonic() < deadline:
             try:
@@ -3468,11 +3631,11 @@ class MicrosoftGraphMailbox:
         email: str,
         token: str,
         *,
-        timeout: int = 180,
-        poll_interval: int = 3,
+        timeout: int = 45,
+        poll_interval: int = 2,
         received_after_epoch: float = 0.0,
     ) -> str:
-        deadline = time.monotonic() + max(5, int(timeout or 180))
+        deadline = time.monotonic() + max(5, int(timeout or 45))
         seen: set = set()
         # Graph timestamps are UTC; allow a small clock skew window.
         min_received = float(received_after_epoch or 0.0) - 5.0
@@ -3651,7 +3814,7 @@ def run_registration(
     turnstile_token: str = "",
     turnstile_provider: str = "",
     turnstile_api_key: str = "",
-    turnstile_solve_timeout: int = 90,
+    turnstile_solve_timeout: int = 60,
     turnstile_solve_retries: int = 1,
     turnstile_proxy: str = "",
     turnstile_headless: bool = False,
@@ -3767,15 +3930,28 @@ def run_registration(
             raise XAIHttpFlowError(
                 "验证码已发送；请用 --email-code 重新运行提交注册，或配置 --mail-config/--mail-file 自动轮询"
             )
+        # Keep mail wait short so dead mailboxes don't occupy concurrency slots.
+        mail_wait = max(15, min(120, int(getattr(client, "timeout", 30) or 30) * 2 if int(getattr(client, "timeout", 30) or 30) < 40 else int(getattr(client, "timeout", 45) or 45)))
+        # Prefer explicit config/env when present.
+        try:
+            cfg_wait = int(float((config or {}).get("mail_code_timeout_sec") or 0))
+            if cfg_wait > 0:
+                mail_wait = max(10, min(180, cfg_wait))
+        except Exception:
+            pass
         try:
             email_code = mailbox.wait_for_xai_code(
                 email,
                 mail_token,
+                timeout=mail_wait,
                 received_after_epoch=requested_at,
             )
         except TypeError:
             # Older/other mailbox adapters may not accept the freshness kwarg.
-            email_code = mailbox.wait_for_xai_code(email, mail_token)
+            try:
+                email_code = mailbox.wait_for_xai_code(email, mail_token, timeout=mail_wait)
+            except TypeError:
+                email_code = mailbox.wait_for_xai_code(email, mail_token)
         _log(
             client.log_callback,
             f"[HTTP] 已收到 xAI 邮箱验证码 | email={mask_email(email)} code={str(email_code)[:3]}***",
@@ -5181,6 +5357,51 @@ def capture_turnstile_token(
     return_result: bool = False,
     log_callback: LogFn = None,
 ) -> Any:
+    """Public entry: rate-limit concurrent local Chrome captures, then solve."""
+    with _local_turnstile_slot(log_callback=log_callback):
+        return _capture_turnstile_token_impl(
+            proxy=proxy,
+            output=output,
+            proxy_used_file=proxy_used_file,
+            selected_proxy_raw=selected_proxy_raw,
+            timeout=timeout,
+            headless=headless,
+            page_url=page_url,
+            click_email_signup=click_email_signup,
+            sitekey=sitekey,
+            action=action,
+            cdata=cdata,
+            user_agent=user_agent,
+            accept_language=accept_language,
+            expected_platform=expected_platform,
+            expected_client_hint_platform=expected_client_hint_platform,
+            expected_browser_major=expected_browser_major,
+            return_result=return_result,
+            log_callback=log_callback,
+        )
+
+
+def _capture_turnstile_token_impl(
+    *,
+    proxy: str = "",
+    output: str = "turnstile.txt",
+    proxy_used_file: str = "",
+    selected_proxy_raw: str = "",
+    timeout: int = 30,
+    headless: bool = False,
+    page_url: str = "",
+    click_email_signup: bool = True,
+    sitekey: str = "",
+    action: str = "",
+    cdata: str = "",
+    user_agent: str = "",
+    accept_language: str = DEFAULT_ACCEPT_LANGUAGE,
+    expected_platform: str = "",
+    expected_client_hint_platform: str = "",
+    expected_browser_major: str = "",
+    return_result: bool = False,
+    log_callback: LogFn = None,
+) -> Any:
     """Open accounts.x.ai/sign-up in Chrome and capture a native Turnstile token.
 
     This intentionally uses a real browser.  It does not solve, forge, or bypass
@@ -5209,6 +5430,7 @@ def capture_turnstile_token(
     page = None
     diag_samples: list[Dict[str, Any]] = []
     hard_block_retried = False
+    capture_started = time.monotonic()
     try:
         browser_proxy, forwarder_instance = _prepare_browser_proxy(
             proxy,

@@ -35,6 +35,7 @@
   "proxy_rotate_session": true,
   "proxy_parent": "",
   "proxy_file": "proxies.txt",
+  "proxy_pool_source": "manual",
   "concurrent_workers": 16,
   "tui_run_mode": "register_otp",
   "tui_proxy_mode": "auto",
@@ -44,6 +45,7 @@
   "local_turnstile_max_workers": 8,
   "submit_workers": 8,
   "proxy_subscription_url": "",
+  "proxy_subscription_urls": [],
   "proxy_subscription_local_http": "",
   "embedded_proxy_enabled": false,
   "embedded_proxy_binary": "",
@@ -60,5 +62,10 @@
   "turnstile_proxy_mode": "pool",
   "turnstile_proxy": "",
   "turnstile_proxy_file": "turnstile_proxies.txt",
-  "turnstile_proxy_random": true
+  "turnstile_proxy_random": true,
+  "cpa_api_url": "",
+  "cpa_api_key": "",
+  "cpa_auto_upload": false,
+  "cpa_use_local_name": true,
+  "cpa_skip_duplicates": true
 }

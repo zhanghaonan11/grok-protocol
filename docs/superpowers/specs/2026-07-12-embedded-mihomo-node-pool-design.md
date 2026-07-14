@@ -139,7 +139,7 @@ NodeSlot:
 | `embedded_proxy_binary` | `""` | 空则自动探测 `mihomo`/`verge-mihomo` |
 | `embedded_proxy_listen_host` | `127.0.0.1` | 仅本机 |
 | `embedded_proxy_base_port` | `28000` | 本地 HTTP 起始端口 |
-| `embedded_proxy_max_nodes` | `50` | 最多接入节点数 |
+| `embedded_proxy_max_nodes` | `50`（`0`=不限制，上限 10000） | 启动时最多接入节点数 |
 | `embedded_proxy_probe_host` | `accounts.x.ai` | 预检主机 |
 | `embedded_proxy_probe_port` | `443` | 预检端口 |
 | `embedded_proxy_probe_timeout_sec` | `5` | 预检超时 |

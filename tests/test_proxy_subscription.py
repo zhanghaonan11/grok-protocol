@@ -41,6 +41,27 @@ class ProxySubscriptionParseTests(unittest.TestCase):
         self.assertFalse(node.usable_http)
         self.assertEqual(node.pool_line, "")
 
+    def test_parse_hysteria2_and_anytls(self):
+        hy = sub.parse_share_link(
+            "hy2://secret@hy.example:8443?sni=hy.example&insecure=1#hy-a"
+        )
+        self.assertIsNotNone(hy)
+        self.assertEqual(hy.scheme, "hysteria2")
+        self.assertEqual(hy.host, "hy.example")
+        self.assertEqual(hy.port, 8443)
+        self.assertEqual(hy.password, "secret")
+        self.assertFalse(hy.usable_http)
+
+        anytls = sub.parse_share_link(
+            "anytls://pwd@any.example:443?sni=any.example&fp=chrome#any-a"
+        )
+        self.assertIsNotNone(anytls)
+        self.assertEqual(anytls.scheme, "anytls")
+        self.assertEqual(anytls.host, "any.example")
+        self.assertEqual(anytls.port, 443)
+        self.assertEqual(anytls.password, "pwd")
+        self.assertFalse(anytls.usable_http)
+
     def test_import_base64_subscription_only_http_goes_to_pool(self):
         plain = "\n".join(
             [
@@ -68,6 +89,114 @@ class ProxySubscriptionParseTests(unittest.TestCase):
         self.assertEqual(len(result.nodes), 2)
         self.assertTrue(result.warnings)
 
+    def test_normalize_subscription_urls_dedupe(self):
+        urls = sub.normalize_subscription_urls(
+            "https://a.example/sub\nhttps://b.example/sub\nhttps://a.example/sub\n"
+        )
+        self.assertEqual(urls, ["https://a.example/sub", "https://b.example/sub"])
+        self.assertEqual(
+            sub.resolve_subscription_urls_from_config(
+                {"proxy_subscription_url": "https://legacy.example/s"}
+            ),
+            ["https://legacy.example/s"],
+        )
+        self.assertEqual(
+            sub.resolve_subscription_urls_from_config(
+                {
+                    "proxy_subscription_urls": ["https://a.example/1"],
+                    "proxy_subscription_url": "https://legacy.example/s",
+                }
+            ),
+            ["https://a.example/1"],
+        )
+
+    def test_import_multiple_urls_merge_and_partial_failure(self):
+        bodies = {
+            "https://a.example/sub": (
+                "http://u:p@1.1.1.1:8080\nvless://id@x.com:443#n\n",
+                "plain",
+            ),
+            "https://b.example/sub": (
+                "http://u2:p2@2.2.2.2:8080\nhttp://u:p@1.1.1.1:8080\n",
+                "plain",
+            ),
+        }
+
+        def fake_fetch(url, timeout=20.0):
+            if url == "https://bad.example/sub":
+                raise ValueError("boom")
+            return bodies[url]
+
+        with mock.patch.object(sub, "fetch_subscription_body", side_effect=fake_fetch):
+            result = sub.import_proxy_subscriptions(
+                [
+                    "https://a.example/sub",
+                    "https://bad.example/sub",
+                    "https://b.example/sub",
+                ]
+            )
+        self.assertEqual(len(result.usable_pool_lines), 2)
+        self.assertIn("1.1.1.1:8080:u:p", result.usable_pool_lines)
+        self.assertIn("2.2.2.2:8080:u2:p2", result.usable_pool_lines)
+        self.assertEqual(len(result.per_url), 3)
+        self.assertTrue(any(not p.get("ok") for p in result.per_url))
+        self.assertTrue(any("拉取失败" in w for w in result.warnings))
+        data = result.to_dict()
+        self.assertEqual(len(data["urls"]), 3)
+
+
+
+    def test_parse_clash_yaml_http_and_inventory(self):
+        yaml_text = """mixed-port: 7890
+proxies:
+- name: http-a
+  type: http
+  server: 10.0.0.1
+  port: 8080
+  username: u
+  password: p
+- name: socks-a
+  type: socks5
+  server: 10.0.0.2
+  port: 1080
+- name: vless-a
+  type: vless
+  server: v.example
+  port: 443
+  uuid: 11111111-1111-1111-1111-111111111111
+  tls: true
+  network: tcp
+- name: hy2-a
+  type: hysteria2
+  server: h.example
+  port: 8443
+  password: secret
+  sni: h.example
+proxy-groups:
+- name: PROXY
+  type: select
+  proxies:
+  - http-a
+  - 🇭🇰 HK|60|M523ms|2406:4440:0:106::11:a|YT|http
+"""
+        nodes = sub.parse_subscription_text(yaml_text)
+        self.assertEqual(len(nodes), 4)
+        http_nodes = [n for n in nodes if n.usable_http]
+        self.assertEqual(len(http_nodes), 1)
+        self.assertEqual(http_nodes[0].pool_line, "10.0.0.1:8080:u:p")
+        self.assertTrue(any(n.scheme == "vless" and n.raw.startswith("vless://") for n in nodes))
+        self.assertTrue(any(n.scheme == "hysteria2" and n.raw.startswith("hysteria2://") for n in nodes))
+        # Proxy-group list names must not become fake http pool lines.
+        self.assertIsNone(
+            sub.parse_share_link("- 🇭🇰 HK|60|M523ms|2406:4440:0:106::11:a|YT|http")
+        )
+
+    def test_hostport_rejects_yaml_like_names(self):
+        self.assertIsNone(sub.parse_share_link("PROXY:select:http-a:extra"))
+        node = sub.parse_share_link("1.2.3.4:8080:user:pass")
+        self.assertIsNotNone(node)
+        self.assertEqual(node.pool_line, "1.2.3.4:8080:user:pass")
+
 
 class ProxySubscriptionServiceTests(unittest.TestCase):
     def test_service_writes_pool_and_switches_mode(self):
@@ -79,6 +208,7 @@ class ProxySubscriptionServiceTests(unittest.TestCase):
                     {
                         "proxy_file": "proxies.txt",
                         "tui_proxy_mode": "none",
+                        "proxy_pool_source": "subscription",
                         "proxy_subscription_local_http": "http://127.0.0.1:7890",
                     }
                 ),
@@ -112,6 +242,7 @@ class ProxySubscriptionServiceTests(unittest.TestCase):
                     {
                         "proxy_file": "proxies.txt",
                         "tui_proxy_mode": "none",
+                        "proxy_pool_source": "subscription",
                         "proxy_subscription_local_http": "http://127.0.0.1:7890",
                     }
                 ),
@@ -142,14 +273,23 @@ class ProxySubscriptionServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             cfg = root / "config.json"
-            cfg.write_text(json.dumps({"proxy_file": "proxies.txt"}), encoding="utf-8")
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "proxy_file": "proxies.txt",
+                        "proxy_pool_source": "subscription",
+                    }
+                ),
+                encoding="utf-8",
+            )
             service = svc.BatchService(config_path=cfg, root_dir=root)
             app = webui_app.create_app(service=service)
             client = TestClient(app)
-            page = client.get("/config")
+            page = client.get("/config/proxy")
             self.assertEqual(page.status_code, 200)
-            self.assertIn("proxy_subscription_url", page.text)
+            self.assertIn("proxy_subscription_urls", page.text)
             self.assertIn("btnImportSub", page.text)
+            self.assertIn("btnEmbeddedFetchSub", page.text)
             plain = "http://a:b@2.2.2.2:9000\n"
             with mock.patch(
                 "proxy_subscription.fetch_subscription_body",

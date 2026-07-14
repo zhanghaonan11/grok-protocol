@@ -278,6 +278,22 @@ def save_credential_file(doc, output_dir):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(doc, f, ensure_ascii=False, indent=2)
         f.write("\n")
+    # Best-effort CPA auto push (config-driven). Never break credential write.
+    try:
+        import cpa_push
+        from pathlib import Path as _Path
+
+        cfg_path = _Path(__file__).resolve().parent / "config.json"
+        cfg = {}
+        if cfg_path.is_file():
+            try:
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            except Exception:
+                cfg = {}
+        if isinstance(cfg, dict) and cfg.get("cpa_auto_upload"):
+            cpa_push.auto_push_credential_file(config=cfg, credential_path=path)
+    except Exception:
+        pass
     return path
 
 

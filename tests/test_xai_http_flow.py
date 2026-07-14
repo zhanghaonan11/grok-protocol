@@ -183,6 +183,80 @@ class XAIHttpFlowTests(unittest.TestCase):
             used = path.with_suffix(path.suffix + ".used").read_text(encoding="utf-8")
             self.assertIn("a@hotmail.com", used)
 
+    def test_ms_mail_parallel_claims_are_unique(self):
+        """Multiple workers claiming under flock must each get a distinct account."""
+        import concurrent.futures
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            cid = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+            lines = [
+                f"u{i}@hotmail.com----pw----{cid}----M.Ctoken{i}"
+                for i in range(12)
+            ]
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            def claim_one(_idx: int) -> str:
+                box = flow.MicrosoftGraphMailbox(str(path), mark_used=True)
+                return box._claim_account()["email"]
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                emails = list(pool.map(claim_one, range(8)))
+            self.assertEqual(len(emails), 8)
+            self.assertEqual(len(set(emails)), 8, f"duplicate claims: {emails}")
+            remaining = [
+                ln.strip()
+                for ln in path.read_text(encoding="utf-8").splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+            self.assertEqual(len(remaining), 4)
+            used = path.with_suffix(path.suffix + ".used").read_text(encoding="utf-8")
+            for email in emails:
+                self.assertIn(email, used)
+
+    def test_ms_mail_release_to_pool_on_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            cid = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+            path.write_text(
+                f"a@hotmail.com----pw----{cid}----M.CtokenA\n"
+                f"b@hotmail.com----pw----{cid}----M.CtokenB\n",
+                encoding="utf-8",
+            )
+            box = flow.MicrosoftGraphMailbox(str(path), mark_used=True)
+            # simulate successful create claim without network token refresh
+            claimed = box._claim_account()
+            box.account = claimed
+            box._claimed_for_return = True
+            self.assertEqual(claimed["email"], "a@hotmail.com")
+            self.assertNotIn("a@hotmail.com", path.read_text(encoding="utf-8"))
+            self.assertIn("a@hotmail.com", path.with_suffix(path.suffix + ".used").read_text(encoding="utf-8"))
+            ok = box.release_to_pool(reason="turnstile_timeout")
+            self.assertTrue(ok)
+            pool = path.read_text(encoding="utf-8")
+            self.assertIn("a@hotmail.com", pool)
+            # first line should be returned account
+            first = [ln for ln in pool.splitlines() if ln.strip()][0]
+            self.assertTrue(first.startswith("a@hotmail.com"))
+            used = path.with_suffix(path.suffix + ".used").read_text(encoding="utf-8")
+            self.assertNotIn("a@hotmail.com----", used)
+            # second release is no-op
+            self.assertFalse(box.release_to_pool(reason="again"))
+
+    def test_ms_mail_commit_success_skips_return(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            cid = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+            path.write_text(f"a@hotmail.com----pw----{cid}----M.CtokenA\n", encoding="utf-8")
+            box = flow.MicrosoftGraphMailbox(str(path), mark_used=True)
+            claimed = box._claim_account()
+            box.account = claimed
+            box._claimed_for_return = True
+            box.commit_success()
+            self.assertFalse(box.release_to_pool(reason="should_skip"))
+            self.assertNotIn("a@hotmail.com", path.read_text(encoding="utf-8"))
+
+
     def test_grpc_unary_reads_status_from_http_headers_when_body_empty(self):
         class HeaderOnlyResponse:
             status_code = 200

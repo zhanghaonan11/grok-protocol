@@ -246,6 +246,191 @@ class ConfigCenterTests(unittest.TestCase):
             self.assertEqual(disk["tui_proxy_mode"], "pool")
             self.assertIn("2.2.2.2:8080:user:pass", pool.read_text(encoding="utf-8"))
 
+    def test_config_center_defaults_proxy_pool_source_manual(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            data = service.get_config_center()
+            self.assertEqual(data["fields"]["proxy_pool_source"], "manual")
+
+    def test_config_center_persists_proxy_pool_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                        "proxy_pool_source": "manual",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            updated = service.update_config_center(
+                {"fields": {"proxy_pool_source": "subscription"}}
+            )
+            self.assertEqual(updated["fields"]["proxy_pool_source"], "subscription")
+            disk = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(disk["proxy_pool_source"], "subscription")
+
+            # switch back
+            updated = service.update_config_center(
+                {"fields": {"proxy_pool_source": "manual"}}
+            )
+            self.assertEqual(updated["fields"]["proxy_pool_source"], "manual")
+            disk = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(disk["proxy_pool_source"], "manual")
+
+    def test_set_proxy_pool_rejects_when_source_is_subscription(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            pool = root / "proxies.txt"
+            pool.write_text("1.1.1.1:80\n", encoding="utf-8")
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                        "proxy_file": "proxies.txt",
+                        "proxy_pool_source": "subscription",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            with self.assertRaises(svc.TuiConfigError) as ctx:
+                service.set_proxy_pool("9.9.9.9:8080\n")
+            self.assertIn("手动维护", str(ctx.exception))
+            self.assertEqual(pool.read_text(encoding="utf-8").strip(), "1.1.1.1:80")
+
+    def test_update_config_center_ignores_pool_text_when_subscription_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            pool = root / "proxies.txt"
+            pool.write_text("keep-me:1\n", encoding="utf-8")
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                        "proxy_file": "proxies.txt",
+                        "proxy_pool_source": "subscription",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            service.update_config_center(
+                {
+                    "fields": {"proxy_pool_source": "subscription"},
+                    "proxy_pool_text": "overwrite:999\n",
+                }
+            )
+            self.assertEqual(pool.read_text(encoding="utf-8").strip(), "keep-me:1")
+
+    def test_import_subscription_rejects_when_source_is_manual(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                        "proxy_pool_source": "manual",
+                        "proxy_subscription_url": "https://example.test/sub",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            with self.assertRaises(svc.TuiConfigError) as ctx:
+                service.import_proxy_subscription(url="https://example.test/sub")
+            self.assertIn("订阅导入", str(ctx.exception))
+
+    def test_import_subscription_writes_pool_when_source_is_subscription(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            pool = root / "proxies.txt"
+            pool.write_text("old:1\n", encoding="utf-8")
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                        "proxy_file": "proxies.txt",
+                        "proxy_pool_source": "subscription",
+                        "proxy_subscription_url": "https://example.test/sub",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+
+            class FakeResult:
+                usable_pool_lines = ["http://u:p@2.2.2.2:8080"]
+                pool_lines = ["# hdr", "http://u:p@2.2.2.2:8080"]
+                def to_dict(self):
+                    return {
+                        "url": "https://example.test/sub",
+                        "body_kind": "plain",
+                        "node_count": 1,
+                        "usable_http_count": 1,
+                        "skipped_count": 0,
+                        "scheme_counts": {"http": 1},
+                        "warnings": [],
+                        "sample_nodes": [],
+                    }
+
+            with mock.patch(
+                "proxy_subscription.import_proxy_subscriptions",
+                return_value=FakeResult(),
+            ):
+                out = service.import_proxy_subscription(
+                    url="https://example.test/sub",
+                    write_pool=True,
+                )
+            self.assertEqual(out.get("proxy_pool_source"), "subscription")
+            text = pool.read_text(encoding="utf-8")
+            self.assertIn("http://u:p@2.2.2.2:8080", text)
+            self.assertNotIn("old:1", text)
+            disk = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(disk["proxy_pool_source"], "subscription")
+            self.assertEqual(disk.get("tui_proxy_mode"), "pool")
+
     def test_config_center_reads_and_writes_local_turnstile_max_workers(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -796,27 +981,22 @@ class EmbeddedProxyBatchServiceTests(unittest.TestCase):
             out = service.ensure_embedded_proxy()
             self.assertEqual(out.get("enabled"), False)
 
+    def _seed_vless_cache(self, service, lines):
+        path = service.embedded_vless_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
     def test_ensure_embedded_proxy_loads_vless_and_starts(self):
         with tempfile.TemporaryDirectory() as d:
             service = self._service(Path(d))
-            fake_result = mock.Mock()
-            fake_result.nodes = [
-                mock.Mock(
-                    scheme="vless",
-                    raw="vless://11111111-1111-1111-1111-111111111111@jp.example:443?security=tls&sni=jp.example#jp",
-                    host="jp.example",
-                    port=443,
-                    name="jp",
-                ),
-                mock.Mock(
-                    scheme="vless",
-                    raw="vless://22222222-2222-2222-2222-222222222222@sg.example:443?security=tls&sni=sg.example#sg",
-                    host="sg.example",
-                    port=443,
-                    name="sg",
-                ),
-                mock.Mock(scheme="http", raw="http://1.1.1.1:80", host="1.1.1.1", port=80, name=""),
-            ]
+            self._seed_vless_cache(
+                service,
+                [
+                    "vless://11111111-1111-1111-1111-111111111111@jp.example:443?security=tls&sni=jp.example#jp",
+                    "vless://22222222-2222-2222-2222-222222222222@sg.example:443?security=tls&sni=sg.example#sg",
+                ],
+            )
 
             start_info = {
                 "running": True,
@@ -840,15 +1020,15 @@ class EmbeddedProxyBatchServiceTests(unittest.TestCase):
             manager._running = False
 
             with mock.patch(
-                "proxy_subscription.import_proxy_subscription",
-                return_value=fake_result,
-            ) as import_mock, mock.patch(
+                "proxy_subscription.fetch_subscription_body",
+                side_effect=AssertionError("ensure must not fetch subscription"),
+            ) as fetch_mock, mock.patch(
                 "embedded_proxy_manager.EmbeddedProxyManager",
                 return_value=manager,
             ) as mgr_cls:
                 out = service.ensure_embedded_proxy(force_reload=True)
 
-            import_mock.assert_called_once()
+            fetch_mock.assert_not_called()
             self.assertTrue(out.get("enabled"))
             self.assertTrue(out.get("running"))
             self.assertEqual(out.get("total"), 2)
@@ -862,28 +1042,57 @@ class EmbeddedProxyBatchServiceTests(unittest.TestCase):
             manager.probe_all.assert_called_once()
             mgr_cls.assert_called()
 
+    def test_ensure_embedded_proxy_raises_when_cache_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            service = self._service(Path(d))
+            with self.assertRaises(svc.TuiConfigError) as ctx:
+                service.ensure_embedded_proxy(force_reload=True)
+            self.assertIn("缓存", str(ctx.exception))
+
+    def test_fetch_embedded_subscription_nodes_writes_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            service = self._service(Path(d))
+            plain = (
+                "vless://11111111-1111-1111-1111-111111111111@jp.example:443?security=tls#jp\n"
+                "hy2://secret@hy.example:8443?sni=hy.example#hy\n"
+                "anytls://pwd@any.example:443?sni=any.example#any\n"
+                "http://1.1.1.1:80\n"
+            )
+            with mock.patch(
+                "proxy_subscription.fetch_subscription_body",
+                return_value=(plain, "plain"),
+            ):
+                data = service.fetch_embedded_subscription_nodes(
+                    urls=["https://example.test/sub"]
+                )
+            self.assertEqual(data.get("cached_node_count"), 3)
+            self.assertEqual(data.get("cached_vless_count"), 1)
+            self.assertEqual((data.get("cached_by_protocol") or {}).get("hysteria2"), 1)
+            self.assertEqual((data.get("cached_by_protocol") or {}).get("anytls"), 1)
+            cache_path = service.embedded_node_cache_path()
+            self.assertTrue(cache_path.is_file())
+            text = cache_path.read_text(encoding="utf-8")
+            self.assertIn("vless://11111111-1111-1111-1111-111111111111@jp.example:443", text)
+            self.assertIn("hy2://secret@hy.example:8443", text)
+            self.assertIn("anytls://pwd@any.example:443", text)
+            disk = json.loads((Path(d) / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(disk.get("proxy_subscription_urls"), ["https://example.test/sub"])
+
     def test_ensure_embedded_proxy_raises_when_all_unhealthy(self):
         with tempfile.TemporaryDirectory() as d:
             service = self._service(Path(d))
-            fake_result = mock.Mock()
-            fake_result.nodes = [
-                mock.Mock(
-                    scheme="vless",
-                    raw="vless://11111111-1111-1111-1111-111111111111@jp.example:443?security=tls#jp",
-                    host="jp.example",
-                    port=443,
-                    name="jp",
-                )
-            ]
+            self._seed_vless_cache(
+                service,
+                [
+                    "vless://11111111-1111-1111-1111-111111111111@jp.example:443?security=tls#jp",
+                ],
+            )
             manager = mock.Mock()
             manager.start.return_value = {"running": True, "total": 1}
             manager.probe_all.return_value = {"total": 1, "healthy": 0, "results": []}
             manager.status.return_value = {"running": True, "total": 1, "healthy": 0}
             manager._running = False
             with mock.patch(
-                "proxy_subscription.import_proxy_subscription",
-                return_value=fake_result,
-            ), mock.patch(
                 "embedded_proxy_manager.EmbeddedProxyManager",
                 return_value=manager,
             ):
@@ -1007,6 +1216,13 @@ class EmbeddedProxyAssignmentTests(unittest.TestCase):
     """Task 5: per-worker embedded mihomo proxy assignment."""
 
     def _make_plan(self, *, embedded=True, proxy_args=None, max_retries=3, count=1):
+        # Pure embedded tests should not also enable HTTP pool hybrid scheduling.
+        if proxy_args is None:
+            proxy_args = (
+                []
+                if embedded
+                else ["--proxy-file", "proxies.txt", "--proxy-random"]
+            )
         return svc.RunPlan(
             config_path=Path("config.json"),
             run_mode=svc.RUN_MODE_REGISTER_OTP,
@@ -1015,8 +1231,8 @@ class EmbeddedProxyAssignmentTests(unittest.TestCase):
             output_dir=Path("."),
             provider="capsolver",
             email_provider="yyds",
-            proxy_mode="pool",
-            proxy_args=proxy_args or ["--proxy-file", "proxies.txt", "--proxy-random"],
+            proxy_mode="pool" if (not embedded or proxy_args) else "none",
+            proxy_args=list(proxy_args),
             turnstile_headless=False,
             sso_convert_retries=5,
             sso_convert_cooldown=3,
@@ -1080,8 +1296,8 @@ class EmbeddedProxyAssignmentTests(unittest.TestCase):
         self.assertTrue(svc._looks_like_proxy_failure("Connection refused by peer"))
         self.assertTrue(svc._looks_like_proxy_failure("curl: (56) Failure"))
         self.assertTrue(svc._looks_like_proxy_failure("curl: (7) Failed to connect"))
-        # Bad egress often surfaces as Turnstile timeout under embedded proxy mode.
-        self.assertTrue(svc._looks_like_proxy_failure("turnstile timeout"))
+        # Turnstile quality timeouts should not burn proxy node retries.
+        self.assertFalse(svc._looks_like_proxy_failure("turnstile timeout"))
         self.assertTrue(svc._looks_like_proxy_failure("curl: (35) TLS connect error"))
         self.assertFalse(svc._looks_like_proxy_failure(""))
 
@@ -1173,7 +1389,9 @@ class EmbeddedProxyAssignmentTests(unittest.TestCase):
         worker.process = mock.Mock()
         worker.process.poll.return_value = 0
         runner._check_processes()
-        manager.release.assert_called_with("n1", failed=False)
+        self.assertTrue(manager.release.called)
+        self.assertEqual(manager.release.call_args.args[0], "n1")
+        self.assertFalse(manager.release.call_args.kwargs.get("failed"))
         self.assertEqual(worker.status, "succeeded")
 
     def test_start_run_ensures_embedded_proxy(self):

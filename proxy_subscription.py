@@ -3,11 +3,13 @@
 
 Supports:
   - base64 / plain text subscription bodies
+  - Clash YAML (`proxies:` list) including type=http/socks5/vless/hysteria2/anytls/...
   - http(s)://user:pass@host:port
   - socks5://user:pass@host:port
   - host:port:user:pass
-  - ss:// / vless:// / vmess:// / trojan://  (parsed for inventory; only HTTP/SOCKS
-    become usable pool entries for this project's curl-based registration flow)
+  - ss:// / vless:// / vmess:// / trojan:// / hy2:// / hysteria2:// / anytls://
+    (non-HTTP schemes are inventory / embedded-mihomo candidates; only HTTP
+    becomes usable pool entries for this project's curl-based registration flow)
 """
 
 from __future__ import annotations
@@ -16,9 +18,14 @@ import base64
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, unquote, urlparse
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
+
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None
 
 
 @dataclass
@@ -44,14 +51,18 @@ class SubscriptionImportResult:
     usable_pool_lines: List[str] = field(default_factory=list)
     skipped: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
-    body_kind: str = ""  # base64 / plain / clash-yaml-ish
+    body_kind: str = ""  # base64 / plain / clash-yaml
+    urls: List[str] = field(default_factory=list)
+    per_url: List[Dict[str, object]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, object]:
         scheme_counts: Dict[str, int] = {}
         for node in self.nodes:
             scheme_counts[node.scheme] = scheme_counts.get(node.scheme, 0) + 1
+        urls = list(self.urls) if self.urls else ([self.url] if self.url else [])
         return {
-            "url": self.url,
+            "url": self.url or (urls[0] if urls else ""),
+            "urls": urls,
             "body_kind": self.body_kind,
             "total_lines": self.total_lines,
             "node_count": len(self.nodes),
@@ -61,6 +72,7 @@ class SubscriptionImportResult:
             "pool_lines": list(self.pool_lines),
             "usable_pool_lines": list(self.usable_pool_lines),
             "warnings": list(self.warnings),
+            "per_url": list(self.per_url),
             "sample_nodes": [
                 {
                     "scheme": n.scheme,
@@ -74,6 +86,83 @@ class SubscriptionImportResult:
                 for n in self.nodes[:12]
             ],
         }
+
+
+def normalize_subscription_urls(
+    value: Union[None, str, Sequence[object]] = None,
+    *extra: object,
+) -> List[str]:
+    """Normalize subscription URL input into a de-duplicated ordered list.
+
+    Accepts a single string (multi-line or comma/semicolon separated), a sequence
+    of strings, and optional extra args. Empty entries are dropped. Relative
+    paths without http(s):// are kept only if they already look like URLs; caller
+    may further validate.
+    """
+    chunks: List[str] = []
+
+    def _push(item: object) -> None:
+        if item is None:
+            return
+        if isinstance(item, (list, tuple, set)):
+            for sub in item:
+                _push(sub)
+            return
+        text = str(item or "").replace("\r\n", "\n").replace("\r", "\n")
+        if not text.strip():
+            return
+        # Prefer line splits; also allow comma/semicolon on a single line.
+        for part in text.split("\n"):
+            part = part.strip()
+            if not part or part.startswith("#"):
+                continue
+            if ("," in part or ";" in part) and "://" not in part.split(",")[0]:
+                # Rare: bare host list — still split.
+                for piece in re.split(r"[,;]+", part):
+                    piece = piece.strip()
+                    if piece:
+                        chunks.append(piece)
+                continue
+            # Full URLs rarely contain unencoded commas in the scheme host; keep whole line
+            # unless it clearly has multiple http(s) tokens.
+            if re.search(r"https?://", part) and len(re.findall(r"https?://", part)) > 1:
+                for m in re.finditer(r"https?://\S+", part):
+                    chunks.append(m.group(0).rstrip(",;"))
+            else:
+                chunks.append(part.rstrip(",;"))
+
+    _push(value)
+    for item in extra:
+        _push(item)
+
+    seen = set()
+    out: List[str] = []
+    for url in chunks:
+        u = str(url or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
+def resolve_subscription_urls_from_config(config: object) -> List[str]:
+    """Read proxy_subscription_urls (+ legacy proxy_subscription_url) from config dict."""
+    cfg = dict(config or {}) if not isinstance(config, dict) else config
+    urls_raw = cfg.get("proxy_subscription_urls")
+    urls = normalize_subscription_urls(urls_raw)
+    if not urls:
+        urls = normalize_subscription_urls(cfg.get("proxy_subscription_url"))
+    return urls
+
+
+def _node_dedupe_key(node: ParsedNode) -> str:
+    if node.usable_http and node.pool_line:
+        return f"http:{node.pool_line}"
+    raw = str(node.raw or "").strip()
+    if raw:
+        return f"raw:{raw}"
+    return f"{node.scheme}:{node.username}@{node.host}:{node.port}:{node.name}"
 
 
 def _safe_b64_decode(text: str) -> Optional[str]:
@@ -117,9 +206,15 @@ def fetch_subscription_body(url: str, *, timeout: float = 20.0) -> Tuple[str, st
     text = raw.decode("utf-8", errors="replace").strip()
     if not text:
         raise ValueError("订阅内容为空")
-    # Clash YAML detection (keep as plain; parser will try lines / proxies list later)
-    if text.lstrip().startswith("proxies:") or "\nproxies:" in text[:1000]:
-        return text, "clash-yaml-ish"
+    # Clash YAML detection (parser will try proxies list later)
+    head = text[:3000]
+    if (
+        text.lstrip().startswith("proxies:")
+        or "\nproxies:" in head
+        or text.lstrip().startswith("mixed-port:")
+        or ("\nproxy-groups:" in head and "\nproxies:" in head)
+    ):
+        return text, "clash-yaml"
     # Many providers return pure base64 without newlines.
     decoded = _safe_b64_decode(text)
     if decoded and (
@@ -164,26 +259,36 @@ def parse_share_link(raw: str) -> Optional[ParsedNode]:
     if not line or line.startswith("#"):
         return None
     # host:port:user:pass
-    if "://" not in line and line.count(":") >= 3:
+    # Strict: avoid Clash YAML list/group lines being misread as proxies.
+    if "://" not in line and not line.lstrip().startswith("-") and line.count(":") >= 3:
         parts = line.split(":")
-        host, port_s, user = parts[0], parts[1], parts[2]
+        host, port_s, user = parts[0].strip(), parts[1].strip(), parts[2]
         password = ":".join(parts[3:])
-        try:
-            port = int(port_s)
-        except ValueError:
-            return None
-        pool = _http_pool_line(host, port, user, password, "http")
-        return ParsedNode(
-            raw=line,
-            scheme="http",
-            host=host,
-            port=port,
-            username=user,
-            password=password,
-            name="",
-            usable_http=True,
-            pool_line=pool,
-        )
+        if (
+            host
+            and " " not in host
+            and not host.startswith("#")
+            and re.fullmatch(r"\d{1,5}", port_s or "")
+            and re.fullmatch(r"[A-Za-z0-9._\[\]-]+", host)
+        ):
+            try:
+                port = int(port_s)
+            except ValueError:
+                port = 0
+            if 1 <= port <= 65535:
+                pool = _http_pool_line(host, port, user, password, "http")
+                if pool:
+                    return ParsedNode(
+                        raw=line,
+                        scheme="http",
+                        host=host,
+                        port=port,
+                        username=user,
+                        password=password,
+                        name="",
+                        usable_http=True,
+                        pool_line=pool,
+                    )
 
     lower = line.lower()
     name = _node_name_from_fragment(line)
@@ -235,7 +340,66 @@ def parse_share_link(raw: str) -> Optional[ParsedNode]:
             username=cred,
             name=name,
             usable_http=False,
-            note="VLESS 需本地客户端（Clash/V2Ray）承接，不能直接写入 HTTP 代理池",
+            note="VLESS 需本地客户端/内嵌 mihomo 承接，不能直接写入 HTTP 代理池",
+        )
+
+    if lower.startswith("hy2://") or lower.startswith("hysteria2://"):
+        # hy2://password@host:port?params#name  (also hysteria2://)
+        scheme = "hysteria2"
+        prefix = "hy2://" if lower.startswith("hy2://") else "hysteria2://"
+        body = line[len(prefix):]
+        main, _, _frag = body.partition("#")
+        cred, _, hostport = main.partition("@")
+        # password may be URL-encoded
+        password = unquote(cred.split("?", 1)[0])
+        host = hostport
+        port = 0
+        if ":" in hostport:
+            host, port_s = hostport.rsplit(":", 1)
+            port_s = port_s.split("?", 1)[0]
+            try:
+                port = int(port_s)
+            except ValueError:
+                port = 0
+        if "?" in host:
+            host = host.split("?", 1)[0]
+        return ParsedNode(
+            raw=line,
+            scheme=scheme,
+            host=host,
+            port=port,
+            password=password,
+            name=name,
+            usable_http=False,
+            note="Hysteria2 需内嵌 mihomo / 本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+
+    if lower.startswith("anytls://"):
+        # anytls://password@host:port?params#name
+        body = line[len("anytls://"):]
+        main, _, _frag = body.partition("#")
+        cred, _, hostport = main.partition("@")
+        password = unquote(cred.split("?", 1)[0])
+        host = hostport
+        port = 0
+        if ":" in hostport:
+            host, port_s = hostport.rsplit(":", 1)
+            port_s = port_s.split("?", 1)[0]
+            try:
+                port = int(port_s)
+            except ValueError:
+                port = 0
+        if "?" in host:
+            host = host.split("?", 1)[0]
+        return ParsedNode(
+            raw=line,
+            scheme="anytls",
+            host=host,
+            port=port,
+            password=password,
+            name=name,
+            usable_http=False,
+            note="AnyTLS 需内嵌 mihomo / 本地客户端承接，不能直接写入 HTTP 代理池",
         )
 
     if lower.startswith("trojan://"):
@@ -299,9 +463,332 @@ def parse_share_link(raw: str) -> Optional[ParsedNode]:
     return None
 
 
-def parse_subscription_text(text: str) -> List[ParsedNode]:
+def _as_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return int(default)
+
+
+def _as_boolish(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "on"}
+
+
+def _clash_query(params: Dict[str, object]) -> str:
+    items = []
+    for key, value in params.items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            value = "1" if value else "0"
+        text = str(value).strip()
+        if text == "":
+            continue
+        items.append((key, text))
+    return urlencode(items, doseq=False, quote_via=quote)
+
+
+def _clash_proxy_to_node(item: object) -> Optional[ParsedNode]:
+    """Convert one Clash `proxies:` entry into ParsedNode."""
+    if not isinstance(item, dict):
+        return None
+    ptype = _as_text(item.get("type")).lower()
+    if not ptype:
+        return None
+    name = _as_text(item.get("name") or item.get("ps") or "")
+    server = _as_text(item.get("server") or "")
+    port = _as_int(item.get("port") or 0)
+    username = _as_text(item.get("username") or item.get("user") or "")
+    password = _as_text(item.get("password") or item.get("passwd") or "")
+    uuid = _as_text(item.get("uuid") or item.get("id") or "")
+
+    if ptype in {"http", "https"}:
+        if not server or port <= 0:
+            return None
+        pool = _http_pool_line(server, port, username, password, "http")
+        if not pool:
+            return None
+        raw = pool if not name else f"{pool}#{name}"
+        return ParsedNode(
+            raw=raw,
+            scheme="http",
+            host=server,
+            port=port,
+            username=username,
+            password=password,
+            name=name,
+            usable_http=True,
+            pool_line=pool,
+            note="from clash yaml",
+        )
+
+    if ptype in {"socks5", "socks5h", "socks4", "socks"}:
+        if not server or port <= 0:
+            return None
+        auth = f"{username}:{password}@" if (username or password) else ""
+        raw = f"socks5://{auth}{server}:{port}"
+        if name:
+            raw = f"{raw}#{name}"
+        return ParsedNode(
+            raw=raw,
+            scheme="socks5",
+            host=server,
+            port=port,
+            username=username,
+            password=password,
+            name=name,
+            usable_http=False,
+            pool_line="",
+            note="socks 节点已解析，但当前注册链路优先支持 HTTP 代理",
+        )
+
+    if ptype == "vless":
+        if not server or port <= 0 or not uuid:
+            return None
+        network = _as_text(item.get("network") or "tcp") or "tcp"
+        security = "tls" if _as_boolish(item.get("tls")) else "none"
+        if item.get("reality-opts") or item.get("reality_opts"):
+            security = "reality"
+        params: Dict[str, object] = {
+            "encryption": _as_text(item.get("encryption") or "none") or "none",
+            "type": network,
+            "security": security,
+        }
+        sni = _as_text(item.get("servername") or item.get("sni") or "")
+        if sni:
+            params["sni"] = sni
+            params["servername"] = sni
+        fp = _as_text(
+            item.get("client-fingerprint")
+            or item.get("client_fingerprint")
+            or item.get("fp")
+            or ""
+        )
+        if fp:
+            params["fp"] = fp
+        flow = _as_text(item.get("flow") or "")
+        if flow:
+            params["flow"] = flow
+        alpn = item.get("alpn")
+        if isinstance(alpn, (list, tuple)):
+            alpn_text = ",".join(str(x).strip() for x in alpn if str(x).strip())
+        else:
+            alpn_text = _as_text(alpn)
+        if alpn_text:
+            params["alpn"] = alpn_text
+        if network == "ws":
+            ws = item.get("ws-opts") or item.get("ws_opts") or {}
+            if isinstance(ws, dict):
+                path = _as_text(ws.get("path") or item.get("path") or "/")
+                headers = ws.get("headers") if isinstance(ws.get("headers"), dict) else {}
+                host_header = _as_text(
+                    (headers or {}).get("Host")
+                    or (headers or {}).get("host")
+                    or item.get("host")
+                    or ""
+                )
+            else:
+                path = _as_text(item.get("path") or "/")
+                host_header = _as_text(item.get("host") or "")
+            params["path"] = path or "/"
+            if host_header:
+                params["host"] = host_header
+        elif network == "grpc":
+            grpc = item.get("grpc-opts") or item.get("grpc_opts") or {}
+            service = ""
+            if isinstance(grpc, dict):
+                service = _as_text(
+                    grpc.get("grpc-service-name") or grpc.get("serviceName") or ""
+                )
+            if service:
+                params["serviceName"] = service
+        reality = item.get("reality-opts") or item.get("reality_opts") or {}
+        if isinstance(reality, dict):
+            if reality.get("public-key") or reality.get("public_key"):
+                params["pbk"] = _as_text(reality.get("public-key") or reality.get("public_key"))
+            if reality.get("short-id") or reality.get("short_id"):
+                params["sid"] = _as_text(reality.get("short-id") or reality.get("short_id"))
+            if reality.get("spider-x") or reality.get("spider_x"):
+                params["spx"] = _as_text(reality.get("spider-x") or reality.get("spider_x"))
+        query = _clash_query(params)
+        raw = f"vless://{quote(uuid, safe='')}@{server}:{port}"
+        if query:
+            raw = f"{raw}?{query}"
+        if name:
+            raw = f"{raw}#{quote(name, safe='')}"
+        return ParsedNode(
+            raw=raw,
+            scheme="vless",
+            host=server,
+            port=port,
+            username=uuid,
+            name=name,
+            usable_http=False,
+            note="VLESS 需本地客户端/内嵌 mihomo 承接，不能直接写入 HTTP 代理池",
+        )
+
+    if ptype in {"hysteria2", "hy2"}:
+        if not server or port <= 0:
+            return None
+        secret = password or uuid
+        if not secret:
+            return None
+        params: Dict[str, object] = {}
+        sni = _as_text(item.get("sni") or item.get("servername") or "")
+        if sni:
+            params["sni"] = sni
+        if "skip-cert-verify" in item or "skip_cert_verify" in item:
+            params["insecure"] = (
+                "1"
+                if _as_boolish(item.get("skip-cert-verify", item.get("skip_cert_verify")))
+                else "0"
+            )
+        obfs = _as_text(item.get("obfs") or "")
+        if obfs:
+            params["obfs"] = obfs
+        obfs_password = _as_text(item.get("obfs-password") or item.get("obfs_password") or "")
+        if obfs_password:
+            params["obfs-password"] = obfs_password
+        query = _clash_query(params)
+        raw = f"hysteria2://{quote(secret, safe='')}@{server}:{port}/"
+        if query:
+            raw = f"{raw}?{query}"
+        if name:
+            raw = f"{raw}#{quote(name, safe='')}"
+        return ParsedNode(
+            raw=raw,
+            scheme="hysteria2",
+            host=server,
+            port=port,
+            password=secret,
+            name=name,
+            usable_http=False,
+            note="Hysteria2 需内嵌 mihomo / 本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+
+    if ptype == "anytls":
+        if not server or port <= 0:
+            return None
+        secret = password or uuid
+        if not secret:
+            return None
+        params: Dict[str, object] = {}
+        sni = _as_text(item.get("sni") or item.get("servername") or "")
+        if sni:
+            params["sni"] = sni
+        fp = _as_text(item.get("client-fingerprint") or item.get("fp") or "")
+        if fp:
+            params["fp"] = fp
+        if "skip-cert-verify" in item or "skip_cert_verify" in item or "insecure" in item:
+            insecure = item.get(
+                "insecure", item.get("skip-cert-verify", item.get("skip_cert_verify"))
+            )
+            params["insecure"] = "1" if _as_boolish(insecure) else "0"
+        query = _clash_query(params)
+        raw = f"anytls://{quote(secret, safe='')}@{server}:{port}"
+        if query:
+            raw = f"{raw}?{query}"
+        if name:
+            raw = f"{raw}#{quote(name, safe='')}"
+        return ParsedNode(
+            raw=raw,
+            scheme="anytls",
+            host=server,
+            port=port,
+            password=secret,
+            name=name,
+            usable_http=False,
+            note="AnyTLS 需内嵌 mihomo / 本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+
+    if server and port > 0:
+        return ParsedNode(
+            raw=f"{ptype}://{server}:{port}" + (f"#{name}" if name else ""),
+            scheme=ptype,
+            host=server,
+            port=port,
+            username=username,
+            password=password or uuid,
+            name=name,
+            usable_http=False,
+            note=f"{ptype} 需本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+    return None
+
+
+def parse_clash_yaml_text(text: str) -> List[ParsedNode]:
+    """Parse Clash-like YAML subscription bodies into nodes."""
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    data = None
+    if yaml is not None:
+        try:
+            data = yaml.safe_load(raw)
+        except Exception:
+            data = None
     nodes: List[ParsedNode] = []
-    for line in str(text or "").splitlines():
+    if isinstance(data, dict):
+        proxies = data.get("proxies")
+        if isinstance(proxies, list):
+            for item in proxies:
+                node = _clash_proxy_to_node(item)
+                if node is not None:
+                    nodes.append(node)
+            return nodes
+    if isinstance(data, list):
+        for item in data:
+            node = _clash_proxy_to_node(item)
+            if node is not None:
+                nodes.append(node)
+        if nodes:
+            return nodes
+
+    # Fallback without PyYAML / on parse failure: only real share links.
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            maybe = stripped[2:].strip().strip("'\"")
+            if "://" in maybe:
+                node = parse_share_link(maybe)
+                if node is not None:
+                    nodes.append(node)
+            continue
+        if "://" in stripped:
+            node = parse_share_link(stripped)
+            if node is not None:
+                nodes.append(node)
+    return nodes
+
+
+def parse_subscription_text(text: str) -> List[ParsedNode]:
+    raw = str(text or "")
+    stripped = raw.lstrip()
+    looks_clash = (
+        stripped.startswith("proxies:")
+        or "\nproxies:" in raw[:3000]
+        or stripped.startswith("mixed-port:")
+        or stripped.startswith("socks-port:")
+        or ("\nproxy-groups:" in raw[:4000] and "\nproxies:" in raw[:4000])
+    )
+    if looks_clash:
+        nodes = parse_clash_yaml_text(raw)
+        if nodes:
+            return nodes
+
+    nodes: List[ParsedNode] = []
+    for line in raw.splitlines():
         node = parse_share_link(line.strip())
         if node is not None:
             nodes.append(node)
@@ -314,44 +801,112 @@ def import_proxy_subscription(
     timeout: float = 20.0,
     include_inventory_comments: bool = True,
 ) -> SubscriptionImportResult:
-    body, kind = fetch_subscription_body(url, timeout=timeout)
-    result = SubscriptionImportResult(url=str(url).strip(), body_kind=kind)
-    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-    result.total_lines = len(lines)
-    nodes = parse_subscription_text(body)
-    result.nodes = nodes
+    """Fetch a single subscription URL. Prefer import_proxy_subscriptions for multi-URL."""
+    return import_proxy_subscriptions(
+        [url],
+        timeout=timeout,
+        include_inventory_comments=include_inventory_comments,
+    )
 
+
+def import_proxy_subscriptions(
+    urls: Union[str, Sequence[object], None],
+    *,
+    timeout: float = 20.0,
+    include_inventory_comments: bool = True,
+) -> SubscriptionImportResult:
+    """Fetch one or more subscription URLs and merge nodes into one result.
+
+    Per-URL failures are recorded in warnings/per_url and do not abort siblings.
+    Raises ValueError only when no valid URL is provided, or every URL fails.
+    """
+    url_list = normalize_subscription_urls(urls)
+    if not url_list:
+        raise ValueError("订阅链接为空")
+
+    for u in url_list:
+        if not (u.startswith("http://") or u.startswith("https://")):
+            raise ValueError(f"订阅链接必须以 http:// 或 https:// 开头: {u}")
+
+    merged = SubscriptionImportResult(url=url_list[0], urls=list(url_list))
+    kinds: List[str] = []
+    node_seen: set = set()
     pool: List[str] = []
-    seen = set()
-    for node in nodes:
-        if node.usable_http and node.pool_line:
-            if node.pool_line not in seen:
-                seen.add(node.pool_line)
-                pool.append(node.pool_line)
-        elif not node.usable_http:
-            result.skipped.append(f"{node.scheme}://{node.host}:{node.port} {node.name}".strip())
+    pool_seen: set = set()
+    any_ok = False
+    fatal_errors: List[str] = []
 
-    # Keep a short inventory header so operators see what was pulled.
+    for sub_url in url_list:
+        entry: Dict[str, object] = {
+            "url": sub_url,
+            "ok": False,
+            "node_count": 0,
+            "usable_http": 0,
+            "body_kind": "",
+            "error": "",
+        }
+        try:
+            body, kind = fetch_subscription_body(sub_url, timeout=timeout)
+            nodes = parse_subscription_text(body)
+            lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+            usable = 0
+            for node in nodes:
+                key = _node_dedupe_key(node)
+                if key not in node_seen:
+                    node_seen.add(key)
+                    merged.nodes.append(node)
+                if node.usable_http and node.pool_line:
+                    if node.pool_line not in pool_seen:
+                        pool_seen.add(node.pool_line)
+                        pool.append(node.pool_line)
+                        usable += 1
+                elif not node.usable_http:
+                    merged.skipped.append(
+                        f"{node.scheme}://{node.host}:{node.port} {node.name}".strip()
+                    )
+            merged.total_lines += len(lines)
+            kinds.append(kind)
+            entry.update(
+                {
+                    "ok": True,
+                    "node_count": len(nodes),
+                    "usable_http": usable,
+                    "body_kind": kind,
+                }
+            )
+            any_ok = True
+        except Exception as exc:
+            err = str(exc) or exc.__class__.__name__
+            entry["error"] = err
+            fatal_errors.append(f"{sub_url}: {err}")
+            merged.warnings.append(f"订阅拉取失败: {sub_url} → {err}")
+        merged.per_url.append(entry)
+
+    if not any_ok:
+        raise ValueError("全部订阅链接拉取失败: " + "; ".join(fatal_errors[:5]))
+
+    merged.body_kind = "+".join(dict.fromkeys(kinds)) if kinds else ""
     header: List[str] = [
-        f"# subscription imported from {result.url}",
-        f"# body_kind={result.body_kind} nodes={len(nodes)} usable_http={len(pool)}",
+        f"# subscription imported from {len(url_list)} url(s)",
+        f"# urls={', '.join(url_list)}",
+        f"# body_kind={merged.body_kind} nodes={len(merged.nodes)} usable_http={len(pool)}",
     ]
     if include_inventory_comments:
-        for node in nodes[:80]:
+        for node in merged.nodes[:80]:
             label = node.name or f"{node.host}:{node.port}"
             flag = "http" if node.usable_http else "need-client"
             header.append(
                 f"# [{flag}] {node.scheme} {label} {node.host}:{node.port}".rstrip(":")
             )
-        if len(nodes) > 80:
-            header.append(f"# ... {len(nodes) - 80} more nodes omitted")
+        if len(merged.nodes) > 80:
+            header.append(f"# ... {len(merged.nodes) - 80} more nodes omitted")
 
     if not pool:
-        result.warnings.append(
+        merged.warnings.append(
             "订阅已拉取，但没有可直接用于注册机的 HTTP 代理节点。"
-            "当前节点多为 VLESS/VMess/SS/Trojan，需要先导入本地 Clash/V2Ray，"
-            "再把本地 HTTP 端口填到“直连代理”或“上游父代理”。"
+            "当前节点多为 VLESS/Hysteria2/AnyTLS/VMess/SS/Trojan，"
+            "可走内嵌 mihomo（VLESS/Hysteria2/AnyTLS）或本地客户端 HTTP 入口。"
         )
-    result.usable_pool_lines = list(pool)
-    result.pool_lines = header + pool
-    return result
+    merged.usable_pool_lines = list(pool)
+    merged.pool_lines = header + pool
+    return merged

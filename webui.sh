@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 HOST="${XAI_WEBUI_HOST:-127.0.0.1}"
-PORT="${XAI_WEBUI_PORT:-33843}"
+PORT="${XAI_WEBUI_PORT:-33844}"
 
 # Prefer project conda python so mode2/curl_cffi deps stay consistent.
 if [[ -x "/home/scv/miniconda3/bin/python3" ]]; then

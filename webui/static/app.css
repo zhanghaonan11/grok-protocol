@@ -356,18 +356,424 @@ label.check .field-title {
 }
 
 
-.proxy-resource-grid {
+/* 配置中心：注册出口 | 求解专用 两列 */
+.proxy-columns {
   display: grid;
   grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  align-items: start;
+}
+.proxy-col {
+  display: flex;
+  flex-direction: column;
   gap: 12px;
+  min-width: 0;
 }
-.proxy-resource-grid .panel.nested {
-  margin: 0;
+.proxy-sub {
   background: #121821;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
 }
-.proxy-resource-grid .pool {
-  min-height: 180px;
+.proxy-sub h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+.proxy-sub h4 {
+  margin: 12px 0 4px;
+  font-size: 13px;
+  color: var(--muted);
+  font-weight: 600;
+}
+.proxy-sub > .muted {
+  margin: 0 0 10px;
+}
+.proxy-columns .pool {
+  min-height: 200px;
+}
+.proxy-columns .box.log {
+  max-height: 260px;
+  overflow: auto;
+}
+.proxy-columns #embeddedProxyStatus {
+  max-height: 200px;
+}
+/* 注册池来源面板：CSS 强制互斥（不依赖 JS 是否跑完） */
+.proxy-col-reg[data-active-pool-source="manual"] [data-pool-source-panel="subscription"],
+.proxy-col-reg[data-active-pool-source="subscription"] [data-pool-source-panel="manual"],
+.proxy-sub[data-pool-source-panel][hidden] {
+  display: none !important;
 }
 @media (max-width: 960px) {
-  .proxy-resource-grid { grid-template-columns: 1fr; }
+  .proxy-columns { grid-template-columns: 1fr; }
 }
+
+
+/* Microsoft mail pool + alias tool (from GPT register UI) */
+.ms-mail-block {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.ms-mail-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.ms-mail-head h3 { margin: 0; }
+.ms-mail-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+.ms-mail-actions button,
+.btn-secondary,
+.btn-flat {
+  cursor: pointer;
+}
+.tool-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,.55);
+  padding: 16px;
+}
+.tool-modal.hidden { display: none; }
+.tool-modal-card {
+  width: min(1100px, 100%);
+  max-height: min(90vh, 900px);
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 16px 48px rgba(0,0,0,.35);
+}
+.tool-modal-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.tool-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+@media (max-width: 900px) {
+  .tool-grid { grid-template-columns: 1fr; }
+}
+.tool-opts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 12px;
+  margin: 8px 0;
+}
+.tool-opts label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.tool-opts label.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.tool-opts input[type="number"],
+.tool-opts select {
+  width: 100%;
+  background: #10161e;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+.tool-status {
+  min-height: 40px;
+  margin: 6px 0 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #121820;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  white-space: pre-wrap;
+  font-size: 12px;
+}
+.tool-status.ok { color: var(--good); border-color: #24553a; }
+.tool-status.warn { color: var(--warn); border-color: #5a4518; }
+.tool-status.err { color: var(--bad); border-color: #5a2a2a; }
+.tool-notes { margin: 8px 0 0; padding-left: 18px; }
+.tool-notes li { margin: 4px 0; }
+code { color: #9ec1ff; }
+
+.ms-target-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 4px 0 8px;
+  grid-column: 1 / -1;
+}
+.ms-target-row .btn-secondary,
+#btnFillMsMailCount {
+  cursor: pointer;
+  background: #243041;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 12px;
+}
+#btnFillMsMailCount:hover {
+  border-color: var(--accent);
+  color: #fff;
+}
+#msMailCountHint { font-size: 12px; }
+
+
+/* config center split pages */
+.subnav {
+  margin-top: 4px;
+}
+.subnav a {
+  font-size: 12px;
+  padding: 5px 10px;
+}
+.config-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 8px;
+}
+.config-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #121821;
+  text-decoration: none;
+  color: var(--text);
+  transition: border-color .15s, background .15s;
+}
+.config-card:hover {
+  border-color: #3d8bfd;
+  background: #17304f;
+}
+.config-card strong { font-size: 14px; }
+.config-card span { color: var(--muted); font-size: 12px; line-height: 1.45; }
+@media (max-width: 960px) {
+  .config-cards { grid-template-columns: 1fr; }
+}
+/* single-column proxy sections after split */
+.proxy-col { display: flex; flex-direction: column; gap: 12px; }
+.cfg-form { display: block; }
+
+
+/* ---- proxy egress presets (simple mode) ---- */
+.egress-presets {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 10px 0 8px;
+}
+.egress-card {
+  text-align: left;
+  border: 1px solid var(--line, #333);
+  background: #141820;
+  color: var(--text, #e8e8e8);
+  border-radius: 12px;
+  padding: 12px 12px 10px;
+  cursor: pointer;
+  min-height: 74px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color .15s ease, background .15s ease, transform .1s ease;
+}
+.egress-card strong {
+  font-size: 14px;
+  font-weight: 700;
+}
+.egress-card span {
+  font-size: 12px;
+  color: var(--muted, #9aa3b2);
+  line-height: 1.35;
+}
+.egress-card:hover {
+  border-color: #4d6bff;
+  transform: translateY(-1px);
+}
+.egress-card.is-active {
+  border-color: #3dd68c;
+  background: #13251c;
+  box-shadow: inset 0 0 0 1px rgba(61, 214, 140, 0.25);
+}
+.egress-card.is-active span {
+  color: #b7f0d1;
+}
+#egressModeHint {
+  margin: 4px 0 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #12161f;
+  border: 1px dashed #2a3344;
+}
+.compact-form {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+@media (max-width: 1100px) {
+  .egress-presets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 720px) {
+  .egress-presets { grid-template-columns: 1fr; }
+  .compact-form { grid-template-columns: 1fr; }
+}
+
+
+/* proxy simple v2 */
+.sr-only-fields {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0,0,0,0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+.simple-tabs {
+  display: flex;
+  gap: 8px;
+  margin: 8px 0 12px;
+}
+.simple-tab {
+  border: 1px solid var(--line, #333);
+  background: #171c26;
+  color: var(--text, #e8e8e8);
+  border-radius: 999px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.simple-tab.is-active {
+  background: #173528;
+  border-color: #3dd68c;
+  color: #b7f0d1;
+}
+.advanced-box {
+  border: 1px solid var(--line, #333);
+  border-radius: 12px;
+  padding: 10px 14px;
+  background: #121821;
+}
+.advanced-box > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #c9d4e5;
+  user-select: none;
+}
+.advanced-box[open] > summary {
+  margin-bottom: 12px;
+}
+.full-width {
+  display: block;
+  width: 100%;
+  margin: 8px 0;
+}
+.full-width input,
+.full-width textarea {
+  width: 100%;
+}
+#directProxyPanel {
+  margin-top: 8px;
+}
+.proxy-columns {
+  align-items: start;
+}
+
+
+/* node pool steps */
+.node-step {
+  border: 1px solid var(--line, #2a3344);
+  border-radius: 12px;
+  padding: 12px;
+  background: #10151d;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.node-step + .node-step {
+  margin-top: 4px;
+}
+.node-step-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.node-step-head strong {
+  font-size: 13px;
+  color: #e7eefc;
+}
+#nodePoolPanel .pool {
+  min-height: 84px;
+}
+#embeddedNodeCacheText {
+  min-height: 180px;
+}
+#btnClearSubUrls,
+#btnClearSubUrlsAndSave,
+#btnClearEmbeddedCache {
+  border-color: #7a3b3b;
+}
+#btnClearSubUrls:hover,
+#btnClearSubUrlsAndSave:hover,
+#btnClearEmbeddedCache:hover {
+  border-color: #ff6b6b;
+  color: #ffd6d6;
+}
+
+
+#egressModeRunHint {
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: #12161f;
+  border: 1px dashed #2a3344;
+}
+#egressModeDetail {
+  margin-top: 0;
+}
+
+
+.panel-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.panel-head-row h2 { margin: 0; }
+#egressStatusBody {
+  min-height: 180px;
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+#egressStatusSummary { margin: 4px 0 8px; }
+
+#speedPresetHint { font-size: 12px; }
+#btnSpeedPreset8 { border-color: #3dd68c; }

@@ -22,6 +22,44 @@ except ImportError:  # pragma: no cover - fallback for environments without PyYA
     yaml = None  # type: ignore
 
 
+def _preferred_local_ports() -> list[str]:
+    """Optional allowlist of verified clean local endpoints.
+
+    File format: one proxy per line, e.g. http://127.0.0.1:28019
+    """
+    import os
+    from pathlib import Path
+    candidates = []
+    env = str(os.environ.get("XAI_GOOD_PROXIES_FILE") or "").strip()
+    if env:
+        candidates.append(Path(env))
+    candidates.extend(
+        [
+            Path("/tmp/xai_good_proxies.txt"),
+            Path(__file__).resolve().parent / "proxies.clean_embedded.txt",
+        ]
+    )
+    ports: list[str] = []
+    seen = set()
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                key = s
+                if key not in seen:
+                    ports.append(key)
+                    seen.add(key)
+            if ports:
+                break
+        except Exception:
+            continue
+    return ports
+
+
 @dataclass
 class NodeSlot:
     id: str
@@ -33,10 +71,12 @@ class NodeSlot:
     raw: str = ""
     params: Dict[str, str] = field(default_factory=dict)
     uuid: str = ""
+    password: str = ""
     healthy: bool = False
     ref_count: int = 0
     success_count: int = 0
     fail_count: int = 0
+    consecutive_tls_fails: int = 0
     last_latency_ms: Optional[float] = None
     cooldown_until: float = 0.0
     last_error: str = ""
@@ -80,12 +120,128 @@ def parse_vless_node(raw: str) -> Optional[dict]:
     return {
         "protocol": "vless",
         "uuid": uuid,
+        "password": "",
         "server": host,
         "port": port,
         "name": name,
         "params": params,
         "raw": line,
     }
+
+
+def parse_hysteria2_node(raw: str) -> Optional[dict]:
+    """Parse hy2:// or hysteria2:// share link for mihomo hysteria2 proxy."""
+    line = str(raw or "").strip()
+    if not line:
+        return None
+    lower = line.lower()
+    if not (lower.startswith("hy2://") or lower.startswith("hysteria2://")):
+        return None
+    try:
+        # Normalize scheme so urlparse accepts hy2
+        normalized = "hysteria2://" + line.split("://", 1)[1]
+        parsed = urlparse(normalized)
+    except Exception:
+        return None
+
+    password = unquote(parsed.username or "")
+    host = parsed.hostname or ""
+    try:
+        port = int(parsed.port or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if not password or not host or port <= 0:
+        return None
+
+    qs = parse_qs(parsed.query or "", keep_blank_values=True)
+    params: Dict[str, str] = {}
+    for key, values in qs.items():
+        if not values:
+            continue
+        params[key] = unquote(values[0])
+
+    name = unquote(parsed.fragment or "") or f"{host}:{port}"
+    return {
+        "protocol": "hysteria2",
+        "uuid": "",
+        "password": password,
+        "server": host,
+        "port": port,
+        "name": name,
+        "params": params,
+        "raw": line,
+    }
+
+
+def parse_anytls_node(raw: str) -> Optional[dict]:
+    """Parse anytls://password@host:port?params#name for mihomo anytls proxy."""
+    line = str(raw or "").strip()
+    if not line:
+        return None
+    if not line.lower().startswith("anytls://"):
+        return None
+    try:
+        parsed = urlparse(line)
+    except Exception:
+        return None
+
+    password = unquote(parsed.username or "")
+    host = parsed.hostname or ""
+    try:
+        port = int(parsed.port or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if not password or not host or port <= 0:
+        return None
+
+    qs = parse_qs(parsed.query or "", keep_blank_values=True)
+    params: Dict[str, str] = {}
+    for key, values in qs.items():
+        if not values:
+            continue
+        params[key] = unquote(values[0])
+
+    name = unquote(parsed.fragment or "") or f"{host}:{port}"
+    return {
+        "protocol": "anytls",
+        "uuid": "",
+        "password": password,
+        "server": host,
+        "port": port,
+        "name": name,
+        "params": params,
+        "raw": line,
+    }
+
+
+# Protocols the embedded mihomo pool can run (share-link schemes → mihomo type).
+EMBEDDED_PROTOCOLS = ("vless", "hysteria2", "anytls")
+EMBEDDED_LINK_PREFIXES = (
+    "vless://",
+    "hy2://",
+    "hysteria2://",
+    "anytls://",
+)
+
+
+def parse_embedded_node(raw: str) -> Optional[dict]:
+    """Parse any supported embedded share link (vless / hy2 / anytls)."""
+    line = str(raw or "").strip()
+    if not line:
+        return None
+    lower = line.lower()
+    if lower.startswith("vless://"):
+        return parse_vless_node(line)
+    if lower.startswith("hy2://") or lower.startswith("hysteria2://"):
+        return parse_hysteria2_node(line)
+    if lower.startswith("anytls://"):
+        return parse_anytls_node(line)
+    return None
+
+
+def is_embedded_share_link(raw: str) -> bool:
+    lower = str(raw or "").strip().lower()
+    return any(lower.startswith(p) for p in EMBEDDED_LINK_PREFIXES)
 
 
 def _proxy_name(node: NodeSlot, used: Set[str]) -> str:
@@ -101,10 +257,15 @@ def _proxy_name(node: NodeSlot, used: Set[str]) -> str:
     return candidate
 
 
+def _as_bool_param(value: object) -> bool:
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "on"}
+
+
 def _node_to_vless_proxy(node: NodeSlot, proxy_name: str) -> Optional[Dict[str, Any]]:
     protocol = (node.protocol or "").lower().strip()
     if protocol and protocol != "vless":
-        logger.warning("skip unsupported protocol %r for node %s", node.protocol, node.id)
+        logger.warning("skip non-vless protocol %r for node %s", node.protocol, node.id)
         return None
     if not node.server or not node.port or not node.uuid:
         logger.warning("skip incomplete vless node %s (server/port/uuid required)", node.id)
@@ -185,13 +346,127 @@ def _node_to_vless_proxy(node: NodeSlot, proxy_name: str) -> Optional[Dict[str, 
     return proxy
 
 
+def _node_to_hysteria2_proxy(node: NodeSlot, proxy_name: str) -> Optional[Dict[str, Any]]:
+    protocol = (node.protocol or "").lower().strip()
+    if protocol and protocol not in {"hysteria2", "hy2"}:
+        return None
+    password = str(node.password or node.uuid or "").strip()
+    if not node.server or not node.port or not password:
+        logger.warning("skip incomplete hysteria2 node %s (server/port/password required)", node.id)
+        return None
+
+    params = dict(node.params or {})
+    sni = params.get("sni") or params.get("servername") or params.get("peer") or ""
+    alpn_raw = params.get("alpn") or ""
+    obfs = params.get("obfs") or ""
+    obfs_password = params.get("obfs-password") or params.get("obfs_password") or ""
+    # Common share-link aliases
+    if not obfs_password:
+        obfs_password = params.get("obfsPassword") or ""
+    insecure = _as_bool_param(params.get("insecure") or params.get("skip-cert-verify") or "")
+    fingerprint = params.get("pinSHA256") or params.get("pin-sha256") or params.get("fingerprint") or ""
+    up = params.get("up") or params.get("upmbps") or ""
+    down = params.get("down") or params.get("downmbps") or ""
+
+    proxy: Dict[str, Any] = {
+        "name": proxy_name,
+        "type": "hysteria2",
+        "server": node.server,
+        "port": int(node.port),
+        "password": password,
+    }
+    if sni:
+        proxy["sni"] = sni
+    if alpn_raw:
+        proxy["alpn"] = [x.strip() for x in alpn_raw.split(",") if x.strip()]
+    if insecure:
+        proxy["skip-cert-verify"] = True
+    if fingerprint:
+        proxy["fingerprint"] = fingerprint
+    if obfs:
+        proxy["obfs"] = obfs
+    if obfs_password:
+        proxy["obfs-password"] = obfs_password
+    if up:
+        proxy["up"] = up
+    if down:
+        proxy["down"] = down
+    return proxy
+
+
+def _node_to_anytls_proxy(node: NodeSlot, proxy_name: str) -> Optional[Dict[str, Any]]:
+    protocol = (node.protocol or "").lower().strip()
+    if protocol and protocol != "anytls":
+        return None
+    password = str(node.password or node.uuid or "").strip()
+    if not node.server or not node.port or not password:
+        logger.warning("skip incomplete anytls node %s (server/port/password required)", node.id)
+        return None
+
+    params = dict(node.params or {})
+    sni = params.get("sni") or params.get("servername") or params.get("peer") or ""
+    alpn_raw = params.get("alpn") or ""
+    fp = params.get("fp") or params.get("client-fingerprint") or params.get("fingerprint") or ""
+    insecure = _as_bool_param(params.get("insecure") or params.get("skip-cert-verify") or "")
+    udp = params.get("udp")
+    idle_session_check_interval = params.get("idle-session-check-interval") or params.get(
+        "idle_session_check_interval"
+    )
+    idle_session_timeout = params.get("idle-session-timeout") or params.get("idle_session_timeout")
+    min_idle_session = params.get("min-idle-session") or params.get("min_idle_session")
+
+    proxy: Dict[str, Any] = {
+        "name": proxy_name,
+        "type": "anytls",
+        "server": node.server,
+        "port": int(node.port),
+        "password": password,
+    }
+    if sni:
+        proxy["sni"] = sni
+    if alpn_raw:
+        proxy["alpn"] = [x.strip() for x in alpn_raw.split(",") if x.strip()]
+    if fp:
+        proxy["client-fingerprint"] = fp
+    if insecure:
+        proxy["skip-cert-verify"] = True
+    if udp is not None and str(udp).strip() != "":
+        proxy["udp"] = _as_bool_param(udp)
+    if idle_session_check_interval:
+        proxy["idle-session-check-interval"] = idle_session_check_interval
+    if idle_session_timeout:
+        proxy["idle-session-timeout"] = idle_session_timeout
+    if min_idle_session:
+        try:
+            proxy["min-idle-session"] = int(min_idle_session)
+        except (TypeError, ValueError):
+            proxy["min-idle-session"] = min_idle_session
+    return proxy
+
+
+def _node_to_mihomo_proxy(node: NodeSlot, proxy_name: str) -> Optional[Dict[str, Any]]:
+    protocol = (node.protocol or "").lower().strip()
+    if not protocol and node.raw:
+        parsed = parse_embedded_node(node.raw)
+        if parsed:
+            protocol = str(parsed.get("protocol") or "")
+    if protocol == "vless":
+        return _node_to_vless_proxy(node, proxy_name)
+    if protocol in {"hysteria2", "hy2"}:
+        return _node_to_hysteria2_proxy(node, proxy_name)
+    if protocol == "anytls":
+        return _node_to_anytls_proxy(node, proxy_name)
+    logger.warning("skip unsupported protocol %r for node %s", node.protocol, node.id)
+    return None
+
+
 def build_mihomo_config(
     nodes: List[NodeSlot],
     *,
     listen_host: str,
     base_port: int,
 ) -> dict:
-    """Build a multi-port mihomo config: one HTTP listener per VLESS node."""
+    """Build a multi-port mihomo config: one HTTP listener per supported node."""
     host = (listen_host or "127.0.0.1").strip() or "127.0.0.1"
     port_base = int(base_port)
 
@@ -202,7 +477,7 @@ def build_mihomo_config(
 
     for node in nodes:
         name = _proxy_name(node, used_names)
-        proxy = _node_to_vless_proxy(node, name)
+        proxy = _node_to_mihomo_proxy(node, name)
         if proxy is None:
             continue
         listen_port = port_base + mapped_index
@@ -292,12 +567,32 @@ class EmbeddedProxyConfig:
     max_nodes: int = DEFAULT_MAX_NODES
     health_interval_sec: float = 30.0
     fail_cooldown_sec: float = 30.0
+    # Extra cooldown multiplier path for consecutive TLS handshake failures.
+    tls_fail_cooldown_sec: float = 60.0
+    tls_fail_cooldown_cap_sec: float = 600.0
     listen_host: str = DEFAULT_LISTEN_HOST
     probe_host: str = DEFAULT_PROBE_HOST
     probe_port: int = DEFAULT_PROBE_PORT
     probe_timeout_sec: float = DEFAULT_PROBE_TIMEOUT_SEC
+    # Concurrent HTTPS probes through local listeners. 8 was too low for 100+ nodes.
+    probe_max_workers: int = 32
     max_node_retries: int = DEFAULT_MAX_NODE_RETRIES
     start_timeout_sec: float = 8.0
+
+
+
+def _is_tls_failure_text(text: str) -> bool:
+    lower = str(text or "").lower()
+    markers = (
+        "curl: (35)",
+        "tls connect error",
+        "openssl_internal",
+        "invalid library",
+        "ssl connect error",
+        "ssl_error",
+        "ssl routines",
+    )
+    return any(m in lower for m in markers)
 
 
 class EmbeddedProxyManager:
@@ -354,14 +649,27 @@ class EmbeddedProxyManager:
             if not candidates:
                 return None
 
+            preferred = _preferred_local_ports()
+            preferred_rank = {p: i for i, p in enumerate(preferred)}
+
             def sort_key(node: NodeSlot):
                 # Prefer historically good, lightly loaded, low-latency nodes.
+                # Also deprioritize nodes with recent consecutive TLS failures.
+                # If a verified clean proxy list exists, prefer those local endpoints first,
+                # but ALWAYS load-balance within that preferred group so 4 concurrent
+                # workers do not all pile onto the same clean port (e.g. 28019).
                 latency = node.last_latency_ms
                 latency_key = (latency is None, latency if latency is not None else 0.0)
+                local_http = str(getattr(node, "local_http", "") or "").strip()
+                pref = preferred_rank.get(local_http, 10_000)
+                preferred_group = 0 if pref < 10_000 else 1
                 return (
+                    preferred_group,
+                    int(node.ref_count or 0),
+                    pref,
+                    int(getattr(node, "consecutive_tls_fails", 0) or 0),
                     -int(getattr(node, "success_count", 0) or 0),
                     int(getattr(node, "fail_count", 0) or 0),
-                    int(node.ref_count or 0),
                     latency_key,
                     str(node.id),
                 )
@@ -370,23 +678,52 @@ class EmbeddedProxyManager:
             selected.ref_count += 1
             return copy(selected)
 
-    def release(self, node_id: str, *, failed: bool = False) -> None:
+    def release(
+        self,
+        node_id: str,
+        *,
+        failed: bool = False,
+        reason: str = "",
+    ) -> None:
         with self._lock:
             node = self._nodes.get(node_id)
             if node is None:
                 return
             node.ref_count = max(0, node.ref_count - 1)
-            if failed:
-                node.fail_count += 1
-                node.healthy = False
-                cooldown = getattr(self, "config", None)
-                base = 30.0
-                if cooldown is not None and hasattr(cooldown, "fail_cooldown_sec"):
-                    base = float(cooldown.fail_cooldown_sec or 30.0)
+            if not failed:
+                # Successful completion resets TLS consecutive counter.
+                node.consecutive_tls_fails = 0
+                if reason:
+                    node.last_error = ""
+                return
+
+            node.fail_count += 1
+            node.healthy = False
+            reason_text = str(reason or node.last_error or "")
+            node.last_error = reason_text[:240]
+            cfg = getattr(self, "config", None)
+            base = 30.0
+            if cfg is not None and hasattr(cfg, "fail_cooldown_sec"):
+                base = float(cfg.fail_cooldown_sec or 30.0)
+
+            tls_hit = _is_tls_failure_text(reason_text)
+            if tls_hit:
+                node.consecutive_tls_fails = int(node.consecutive_tls_fails or 0) + 1
+                tls_base = 60.0
+                tls_cap = 600.0
+                if cfg is not None:
+                    tls_base = float(getattr(cfg, "tls_fail_cooldown_sec", 60.0) or 60.0)
+                    tls_cap = float(getattr(cfg, "tls_fail_cooldown_cap_sec", 600.0) or 600.0)
+                # 1st TLS: tls_base, then 2x/4x/8x ... capped.
+                mult = 2 ** max(0, min(int(node.consecutive_tls_fails or 1) - 1, 4))
+                seconds = min(tls_cap, tls_base * mult)
+            else:
+                # Non-TLS failure: do not accumulate TLS streak.
+                node.consecutive_tls_fails = 0
                 # Progressive cooldown: 1st fail ~base, then 2x/3x/4x (cap).
                 mult = max(1, min(int(node.fail_count or 1), 4))
                 seconds = base * mult
-                node.cooldown_until = time.time() + seconds
+            node.cooldown_until = time.time() + float(seconds)
 
     def status(self) -> dict:
         # Status should reflect post-cooldown availability, not sticky dead flags.
@@ -402,6 +739,7 @@ class EmbeddedProxyManager:
                     "healthy": n.healthy,
                     "ref_count": n.ref_count,
                     "fail_count": n.fail_count,
+                    "consecutive_tls_fails": int(getattr(n, "consecutive_tls_fails", 0) or 0),
                     "success_count": n.success_count,
                     "last_latency_ms": n.last_latency_ms,
                     "cooldown_until": n.cooldown_until,
@@ -497,7 +835,11 @@ class EmbeddedProxyManager:
         binary = find_mihomo_binary(cfg.binary_path or "")
         listen_host = (cfg.listen_host or DEFAULT_LISTEN_HOST).strip() or DEFAULT_LISTEN_HOST
         base_port = int(cfg.base_port or DEFAULT_BASE_PORT)
-        max_nodes = int(cfg.max_nodes or DEFAULT_MAX_NODES)
+        # 0 means unlimited; do not fall back via `or` because 0 is falsy.
+        try:
+            max_nodes = int(cfg.max_nodes) if cfg.max_nodes is not None else DEFAULT_MAX_NODES
+        except (TypeError, ValueError):
+            max_nodes = DEFAULT_MAX_NODES
         selected = list(nodes)[:max_nodes] if max_nodes > 0 else list(nodes)
         if not selected:
             raise ValueError("no nodes to start embedded mihomo")
@@ -512,7 +854,7 @@ class EmbeddedProxyManager:
             base_port=base_port,
         )
         if not mihomo_cfg.get("listeners"):
-            raise ValueError("no usable vless nodes for mihomo config")
+            raise ValueError("no usable embedded nodes (vless/hysteria2/anytls) for mihomo config")
 
         runtime_dir, config_path, log_path = self._runtime_paths()
         config_path.write_text(render_mihomo_yaml(mihomo_cfg), encoding="utf-8")
@@ -596,7 +938,7 @@ class EmbeddedProxyManager:
             except Exception:
                 pass
 
-    def probe_one(self, node_id: str) -> dict:
+    def probe_one(self, node_id: str, *, timeout_sec: Optional[float] = None) -> dict:
         """Probe one node via local HTTP proxy to configured host:port."""
         with self._lock:
             node = self._nodes.get(node_id)
@@ -607,7 +949,10 @@ class EmbeddedProxyManager:
 
         host = (cfg.probe_host or DEFAULT_PROBE_HOST).strip() or DEFAULT_PROBE_HOST
         port = int(cfg.probe_port or DEFAULT_PROBE_PORT)
-        timeout = float(cfg.probe_timeout_sec or DEFAULT_PROBE_TIMEOUT_SEC)
+        if timeout_sec is None:
+            timeout = float(cfg.probe_timeout_sec or DEFAULT_PROBE_TIMEOUT_SEC)
+        else:
+            timeout = max(0.3, float(timeout_sec))
         if not local_http:
             err = "missing local_http"
             with self._lock:
@@ -650,6 +995,7 @@ class EmbeddedProxyManager:
             if node is not None:
                 node.healthy = healthy
                 if healthy:
+                    node.consecutive_tls_fails = 0
                     node.last_latency_ms = latency_ms
                     node.last_error = ""
                     node.cooldown_until = 0.0
@@ -667,28 +1013,140 @@ class EmbeddedProxyManager:
             "target": f"{host}:{port}",
         }
 
-    def probe_all(self, max_workers: int = 8) -> dict:
-        """Probe all nodes with limited concurrency."""
+    def _default_probe_workers(self, total: int) -> int:
+        cfg_workers = int(getattr(self.config, "probe_max_workers", 0) or 0)
+        if cfg_workers > 0:
+            base = cfg_workers
+        else:
+            # Scale with pool size; keep a useful floor/ceiling.
+            base = 32 if total >= 40 else 16 if total >= 16 else 8
+        return max(1, min(int(base), int(total), 64))
+
+    def probe_all(
+        self,
+        max_workers: int = 0,
+        *,
+        timeout_sec: Optional[float] = None,
+        min_healthy: int = 0,
+        ready_wait_sec: Optional[float] = None,
+        continue_in_background: bool = False,
+    ) -> dict:
+        """Probe nodes with higher concurrency and optional early-ready.
+
+        When ``continue_in_background`` is true and ``min_healthy`` is reached,
+        return immediately while remaining probes keep running in a daemon thread.
+        """
         with self._lock:
             ids = list(self._nodes.keys())
         if not ids:
-            return {"total": 0, "healthy": 0, "results": []}
+            return {"total": 0, "healthy": 0, "results": [], "partial": False}
 
-        workers = max(1, min(int(max_workers or 8), len(ids)))
-        results: List[dict] = []
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(self.probe_one, nid): nid for nid in ids}
-            for fut in as_completed(futs):
-                try:
-                    results.append(fut.result())
-                except Exception as exc:
+        workers = int(max_workers or 0)
+        if workers <= 0:
+            workers = self._default_probe_workers(len(ids))
+        workers = max(1, min(workers, len(ids), 64))
+        min_h = max(0, int(min_healthy or 0))
+        started = time.time()
+        ready_deadline = None
+        if ready_wait_sec is not None and min_h > 0:
+            ready_deadline = started + max(0.2, float(ready_wait_sec))
+
+        # Full synchronous path (manual re-probe / second chance).
+        if not continue_in_background or min_h <= 0:
+            results: List[dict] = []
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {
+                    pool.submit(self.probe_one, nid, timeout_sec=timeout_sec): nid
+                    for nid in ids
+                }
+                for fut in as_completed(futs):
                     nid = futs[fut]
-                    results.append({"id": nid, "healthy": False, "error": str(exc)})
+                    try:
+                        results.append(fut.result())
+                    except Exception as exc:
+                        results.append({"id": nid, "healthy": False, "error": str(exc)})
+            healthy = sum(1 for r in results if r.get("healthy"))
+            return {
+                "total": len(results),
+                "healthy": healthy,
+                "results": results,
+                "partial": False,
+                "workers": workers,
+                "elapsed_ms": int((time.time() - started) * 1000),
+            }
 
-        healthy = sum(1 for r in results if r.get("healthy"))
+        # Early-ready path: fire all probes in a background pool, wait only until
+        # min_healthy or deadline, then return without waiting for the rest.
+        self._start_background_probe(ids, max_workers=workers, timeout_sec=timeout_sec)
+
+        while True:
+            with self._lock:
+                healthy = sum(1 for n in self._nodes.values() if n.healthy)
+                total = len(self._nodes)
+            if healthy >= min_h:
+                break
+            if ready_deadline is not None and time.time() >= ready_deadline:
+                break
+            # If background finished early, stop waiting.
+            # We cannot easily know thread state; just sleep briefly.
+            if time.time() - started > max(30.0, float(timeout_sec or 5) * 3 + 5):
+                break
+            time.sleep(0.05)
+
+        with self._lock:
+            healthy = sum(1 for n in self._nodes.values() if n.healthy)
+            total = len(self._nodes)
+            # Snapshot current results for UI without blocking remaining probes.
+            results = [
+                {
+                    "id": n.id,
+                    "healthy": bool(n.healthy),
+                    "latency_ms": n.last_latency_ms if n.healthy else None,
+                    "error": n.last_error,
+                    "local_http": n.local_http,
+                }
+                for n in self._nodes.values()
+            ]
         return {
-            "total": len(results),
+            "total": total,
             "healthy": healthy,
             "results": results,
+            "partial": bool(healthy < total),
+            "workers": workers,
+            "elapsed_ms": int((time.time() - started) * 1000),
         }
+
+    def _start_background_probe(
+        self,
+        node_ids: List[str],
+        *,
+        max_workers: int,
+        timeout_sec: Optional[float],
+    ) -> None:
+        ids = [str(x) for x in (node_ids or []) if str(x)]
+        if not ids:
+            return
+
+        def _job() -> None:
+            try:
+                workers = max(1, min(int(max_workers or 8), len(ids), 64))
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futs = [
+                        pool.submit(self.probe_one, nid, timeout_sec=timeout_sec)
+                        for nid in ids
+                    ]
+                    for fut in as_completed(futs):
+                        try:
+                            fut.result()
+                        except Exception:
+                            pass
+            except Exception:
+                logger.exception("background probe failed")
+
+        thread = threading.Thread(
+            target=_job,
+            name="embedded-proxy-bg-probe",
+            daemon=True,
+        )
+        thread.start()
 

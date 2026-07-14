@@ -539,6 +539,35 @@ def load_sso_list(path: str | None, single: str | None) -> list[str]:
     return out
 
 
+def _maybe_auto_push_cpa(path: Path, *, prefix: str = "") -> None:
+    """Best-effort CPA auto push after a credential JSON is written."""
+    try:
+        import cpa_push
+
+        cfg_path = Path(__file__).resolve().parent / "config.json"
+        cfg = {}
+        if cfg_path.is_file():
+            try:
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            except Exception:
+                cfg = {}
+        if not (isinstance(cfg, dict) and cfg.get("cpa_auto_upload")):
+            return
+
+        def _cpa_log(msg: str) -> None:
+            head = f"{prefix} " if prefix else ""
+            log(f"{head}[CPA] {msg}")
+
+        cpa_push.auto_push_credential_file(
+            config=cfg,
+            credential_path=path,
+            log=_cpa_log,
+        )
+    except Exception as exc:
+        head = f"{prefix} " if prefix else ""
+        log(f"{head}[CPA] 自动推送异常: {exc}")
+
+
 def process_auth_one(idx: int, total: int, sso: str, out_dir: Path, email: str) -> bool:
     prefix = f"[{idx}/{total}]"
     try:
@@ -552,6 +581,7 @@ def process_auth_one(idx: int, total: int, sso: str, out_dir: Path, email: str) 
         subject_for_name = str(doc.get("sub") or "")
         path = out_dir / credential_file_name(email_for_name, subject_for_name)
         write_json(path, doc)
+        _maybe_auto_push_cpa(path, prefix=prefix)
         sso_path = out_dir / sso_file_name(email_for_name, subject_for_name)
         try:
             write_sso_file(sso_path, sso)
@@ -589,6 +619,7 @@ def process_noauth_one(idx: int, total: int, line: str, out_dir: Path, email: st
         label = str(doc.get("email") or doc.get("sub") or secrets.token_hex(4))
         path = out_dir / credential_file_name(str(doc.get("email") or ""), str(doc.get("sub") or ""))
         write_json(path, doc)
+        _maybe_auto_push_cpa(path, prefix=prefix)
         size = path.stat().st_size
         log(f"{prefix} ✅ {label} → {path.name} ({size}B)")
         return True

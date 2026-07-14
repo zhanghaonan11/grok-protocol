@@ -4,423 +4,77 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>配置中心 · xAI HTTP</title>
-  <link rel="stylesheet" href="/static/app.css" />
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/static/favicon.ico" sizes="any" />
+  <link rel="icon" href="/static/favicon-32.png" type="image/png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png" sizes="180x180" />
+  <link rel="stylesheet" href="/static/app.css?v=config-secret-guard-3" />
 </head>
 <body>
   <header class="top">
     <div class="top-main">
       <div>
         <h1>配置中心</h1>
-        <p class="muted">本机 {{ host }}:{{ port }} · 管理 API Key、代理开关与代理池内容</p>
+        <p class="muted">本机 {{ host }}:{{ port }} · 选择配置分区</p>
       </div>
-      <nav class="nav">
+      <nav class="nav" aria-label="主导航">
         <a href="/" class="{% if active == 'run' %}active{% endif %}">运行台</a>
         <a href="/config" class="{% if active == 'config' %}active{% endif %}">配置中心</a>
         <a href="/credentials" class="{% if active == 'credentials' %}active{% endif %}">凭证列表</a>
+        <a href="/cpa" class="{% if active == 'cpa' %}active{% endif %}">CPA 巡检</a>
+      </nav>
+      
+      <nav class="nav subnav" aria-label="配置分区">
+        <a href="/config" class="active">总览</a>
+        <a href="/config/mail" class="">邮箱 / 验证码</a>
+        <a href="/config/output" class="">产物 / 推送</a>
+        <a href="/config/proxy" class="">注册代理</a>
+        <a href="/config/turnstile" class="">求解代理</a>
       </nav>
     </div>
   </header>
 
   <main class="grid">
-    <section class="panel wide">
-      <div class="actions" style="margin-top:0">
+<section class="panel wide">
+      <div class="actions" style="margin-top:0" data-config-page="overview">
         <button type="button" id="btnReloadCfg">重载</button>
-        <button type="button" id="btnSaveCfg" class="primary">保存配置</button>
-        <button type="button" id="btnSavePool">仅保存代理池</button>
-        <button type="button" id="btnImportSub" class="btn">拉取订阅</button>
-        <button type="button" id="btnTestPool" title="同步测试注册代理池与求解代理池，各随机 5 条">随机测试5条</button>
+        
+        
       </div>
       <p id="cfgMsg" class="msg"></p>
     </section>
-
-    <section class="panel">
-      <h2>邮箱 / Turnstile</h2>
-      <form id="cfgCenterForm" class="form">
-        <label>
-          <span class="field-title">
-            邮箱源
-            <button type="button" class="help-tip" aria-label="说明" data-tip="选临时邮箱服务商，决定用哪套邮箱配置">?</button>
-          </span>
-          <select name="email_provider">
-            <option value="yyds">yyds</option>
-            <option value="cloudflare">cloudflare</option>
-            <option value="duckmail">duckmail</option>
-            <option value="msgraph">msgraph/outlook</option>
-          </select>
-        </label>
-        <label>
-          <span class="field-title">
-            YYDS API Base
-            <button type="button" class="help-tip" aria-label="说明" data-tip="YYDS 接口地址，一般不用改默认值">?</button>
-          </span>
-          <input name="yyds_api_base" type="text" />
-        </label>
-        <label>
-          <span class="field-title">
-            YYDS API Key
-            <button type="button" class="help-tip" aria-label="说明" data-tip="YYDS 密钥；空=未配置，清空保存=删除">?</button>
-          </span>
-          <div class="secret-row">
-            <input name="yyds_api_key" type="text" placeholder="空=未配置" autocomplete="off" />
-          </div>
-          <span class="flag" data-flag="yyds_api_key"></span>
-        </label>
-        <label>
-          <span class="field-title">
-            YYDS JWT
-            <button type="button" class="help-tip" aria-label="说明" data-tip="YYDS 登录令牌；可与 API Key 二选一">?</button>
-          </span>
-          <div class="secret-row">
-            <input name="yyds_jwt" type="text" placeholder="空=未配置" autocomplete="off" />
-          </div>
-          <span class="flag" data-flag="yyds_jwt"></span>
-        </label>
-        <label>
-          <span class="field-title">
-            YYDS 建邮间隔(秒)
-            <button type="button" class="help-tip" aria-label="说明" data-tip="只限制创建邮箱请求的最小间隔。默认 1.5；接口允许更高吞吐时可调小，例如 0.05≈20/s，0=不额外限速（仍会走全局锁）">?</button>
-          </span>
-          <input name="yyds_create_spacing_sec" type="number" min="0" max="60" step="0.05" value="1.5" />
-        </label>
-        <label>
-          <span class="field-title">
-            Turnstile 提供商
-            <button type="button" class="help-tip" aria-label="说明" data-tip="验证码求解方式：本地浏览器或第三方">?</button>
-          </span>
-          <select name="turnstile_provider">
-            <option value="local">local</option>
-            <option value="capsolver">capsolver</option>
-            <option value="2captcha">2captcha</option>
-            <option value="yescaptcha">yescaptcha</option>
-          </select>
-        </label>
-        <label>
-          <span class="field-title">
-            Turnstile API Key
-            <button type="button" class="help-tip" aria-label="说明" data-tip="第三方求解服务的 Key；local 可留空">?</button>
-          </span>
-          <div class="secret-row">
-            <input name="turnstile_api_key" type="text" placeholder="空=未配置" autocomplete="off" />
-          </div>
-          <span class="flag" data-flag="turnstile_api_key"></span>
-        </label>
-        <label class="check">
-          <input type="checkbox" name="turnstile_headless" />
-          <span class="field-title">
-            Turnstile 无头
-            <button type="button" class="help-tip" aria-label="说明" data-tip="本地求解时尽量不弹窗（需 Xvfb 环境）">?</button>
-          </span>
-        </label>
-        <label>
-          <span class="field-title">
-            本地 Turnstile 并发上限
-            <button type="button" class="help-tip" aria-label="说明" data-tip="仅 local 生效；总并发仍受运行台与 32 上限约束">?</button>
-          </span>
-          <input name="local_turnstile_max_workers" type="number" min="1" max="6666" value="8" />
-        </label>
-        <label>
-          <span class="field-title">
-            Turnstile 单次超时(秒)
-            <button type="button" class="help-tip" aria-label="说明" data-tip="单次求解最长等待，默认 90；超时后可按重试次数再试">?</button>
-          </span>
-          <input name="turnstile_solve_timeout" type="number" min="5" max="600" value="90" />
-        </label>
-        <label>
-          <span class="field-title">
-            Turnstile 重试次数
-            <button type="button" class="help-tip" aria-label="说明" data-tip="含首次，默认 1。失败会结束该任务；需要捞单时可调到 2">?</button>
-          </span>
-          <input name="turnstile_solve_retries" type="number" min="1" max="10" value="1" />
-        </label>
-        <label>
-          <span class="field-title">
-            提交并发 submit_workers
-            <button type="button" class="help-tip" aria-label="说明" data-tip="注册提交阶段并发槽；默认 4，范围 1-32。Turnstile 解完后的提交会受这个限制">?</button>
-          </span>
-          <input name="submit_workers" type="number" min="1" max="32" value="4" />
-        </label>
-        <label>
-          <span class="field-title">
-            Cloudflare API Base
-            <button type="button" class="help-tip" aria-label="说明" data-tip="Cloudflare 临时邮箱 Worker 的 API 根地址">?</button>
-          </span>
-          <input name="cloudflare_api_base" type="text" />
-        </label>
-        <label>
-          <span class="field-title">
-            Cloudflare API Key
-            <button type="button" class="help-tip" aria-label="说明" data-tip="匿名模式留空；admin 模式填管理密码">?</button>
-          </span>
-          <div class="secret-row">
-            <input name="cloudflare_api_key" type="text" placeholder="空=未配置" autocomplete="off" />
-          </div>
-          <span class="flag" data-flag="cloudflare_api_key"></span>
-        </label>
-        <label>
-          <span class="field-title">
-            DuckMail API Key
-            <button type="button" class="help-tip" aria-label="说明" data-tip="DuckMail 服务密钥；选 duckmail 时必填">?</button>
-          </span>
-          <div class="secret-row">
-            <input name="duckmail_api_key" type="text" placeholder="空=未配置" autocomplete="off" />
-          </div>
-          <span class="flag" data-flag="duckmail_api_key"></span>
-        </label>
-        <label>
-          <span class="field-title">
-            MS 邮箱文件
-            <button type="button" class="help-tip" aria-label="说明" data-tip="Outlook 四段账号文件路径（msgraph 用）">?</button>
-          </span>
-          <input name="ms_mail_file" type="text" />
-        </label>
-      </form>
-    </section>
-
-    <section class="panel">
-      <h2>代理开关</h2>
-      <div class="form" id="proxyForm">
-        <label>
-          <span class="field-title">
-            代理模式
-            <button type="button" class="help-tip" aria-label="说明" data-tip="auto/直连/代理池/关闭，控制出口怎么走">?</button>
-          </span>
-          <select name="proxy_mode" form="cfgCenterForm">
-            <option value="auto">自动</option>
-            <option value="none">关闭（不使用）</option>
-            <option value="direct">直连代理</option>
-            <option value="pool">代理池</option>
-          </select>
-        </label>
-        <label>
-          <span class="field-title">
-            直连代理 URL
-            <button type="button" class="help-tip" aria-label="说明" data-tip="单个代理地址，格式如 http://user:pass@host:port">?</button>
-          </span>
-          <input name="proxy" form="cfgCenterForm" type="text" placeholder="http://user:pass@host:port" />
-        </label>
-        <label>
-          <span class="field-title">
-            代理池文件
-            <button type="button" class="help-tip" aria-label="说明" data-tip="代理列表文件路径，默认 proxies.txt">?</button>
-          </span>
-          <input name="proxy_file" form="cfgCenterForm" type="text" placeholder="proxies.txt" />
-        </label>
-        <label>
-          <span class="field-title">
-            订阅链接
-            <button type="button" class="help-tip" aria-label="说明" data-tip="支持 base64/明文订阅。HTTP 代理会写入池；VLESS/SS 等会解析并提示需本地客户端">?</button>
-          </span>
-          <input name="proxy_subscription_url" form="cfgCenterForm" type="text" placeholder="https://example.com/api/v1/sub?token=..." />
-        </label>
-        <label>
-          <span class="field-title">
-            订阅本地 HTTP 入口
-            <button type="button" class="help-tip" aria-label="说明" data-tip="当订阅全是 VLESS/SS 时，填写本地 Clash/V2Ray 的 HTTP 端口，如 http://127.0.0.1:7890">?</button>
-          </span>
-          <input name="proxy_subscription_local_http" form="cfgCenterForm" type="text" placeholder="http://127.0.0.1:7890" />
-        </label>
-        <label>
-          <span class="field-title">
-            上游父代理
-            <button type="button" class="help-tip" aria-label="说明" data-tip="先经本地 Clash 等再上认证代理（可选）">?</button>
-          </span>
-          <input name="proxy_parent" form="cfgCenterForm" type="text" />
-        </label>
-        <label>
-          <span class="field-title">
-            本地转发端口
-            <button type="button" class="help-tip" aria-label="说明" data-tip="本机无认证转发端口，浏览器流常用">?</button>
-          </span>
-          <input name="local_proxy_port" form="cfgCenterForm" type="number" min="1" max="65535" />
-        </label>
-        <label class="check">
-          <input type="checkbox" name="proxy_random" form="cfgCenterForm" />
-          <span class="field-title">
-            代理池随机
-            <button type="button" class="help-tip" aria-label="说明" data-tip="从代理池随机挑，而不是固定顺序">?</button>
-          </span>
-        </label>
-        <label class="check">
-          <input type="checkbox" name="proxy_rotate_session" form="cfgCenterForm" />
-          <span class="field-title">
-            轮换 session
-            <button type="button" class="help-tip" aria-label="说明" data-tip="尽量换会话出口，降低同 IP 连打风险">?</button>
-          </span>
-        </label>
-        <label>
-          <span class="field-title">
-            OAuth 输出目录
-            <button type="button" class="help-tip" aria-label="说明" data-tip="SSO/凭证 JSON 写出目录">?</button>
-          </span>
-          <input name="xai_oauth_output_dir" form="cfgCenterForm" type="text" />
-        </label>
-        <label>
-          <span class="field-title">
-            Grok2API Remote Base
-            <button type="button" class="help-tip" aria-label="说明" data-tip="远端 grok2api 站点或管理 API 地址">?</button>
-          </span>
-          <input name="grok2api_remote_base" form="cfgCenterForm" type="text" />
-        </label>
-        <label>
-          <span class="field-title">
-            Grok2API App Key
-            <button type="button" class="help-tip" aria-label="说明" data-tip="远端 grok2api 的 app key">?</button>
-          </span>
-          <div class="secret-row">
-            <input name="grok2api_remote_app_key" form="cfgCenterForm" type="text" placeholder="空=未配置" autocomplete="off" />
-          </div>
-          <span class="flag" data-flag="grok2api_remote_app_key"></span>
-        </label>
-        <label>
-          <span class="field-title">
-            Grok2API Pool Name
-            <button type="button" class="help-tip" aria-label="说明" data-tip="写入远端时使用的 token 池名称">?</button>
-          </span>
-          <input name="grok2api_pool_name" form="cfgCenterForm" type="text" />
-        </label>
-      </div>
-      <p class="muted" id="poolMeta">代理池: -</p>
-    </section>
-
-
     <section class="panel wide">
-      <h2>代理资源区</h2>
-      <p class="muted">两行两列：注册侧内嵌代理/HTTP 代理池，与求解侧独立代理池分开管理。开启求解专用代理后，Turnstile 求解请求不再复用注册出口。</p>
-      <div class="proxy-resource-grid">
-        <section class="panel nested">
-          <h2>内嵌代理内核</h2>
-          <p class="muted">启用后，注册任务从订阅 VLESS 节点拉起本机 mihomo 多端口池。</p>
-          <div class="form" id="embeddedProxyForm">
-            <label class="check">
-              <input type="checkbox" name="embedded_proxy_enabled" form="cfgCenterForm" />
-              <span class="field-title">
-                启用内嵌 mihomo
-                <button type="button" class="help-tip" aria-label="说明" data-tip="打开后注册任务走本机 mihomo 节点池，而不是直接用 HTTP 代理池">?</button>
-              </span>
-            </label>
-            <label>
-              <span class="field-title">
-                mihomo 二进制
-                <button type="button" class="help-tip" aria-label="说明" data-tip="可填绝对路径；空则自动查找 mihomo / verge-mihomo">?</button>
-              </span>
-              <input name="embedded_proxy_binary" form="cfgCenterForm" type="text" placeholder="/usr/bin/verge-mihomo" />
-            </label>
-            <label>
-              <span class="field-title">
-                起始端口
-                <button type="button" class="help-tip" aria-label="说明" data-tip="节点本地 HTTP 监听起始端口，默认 28000">?</button>
-              </span>
-              <input name="embedded_proxy_base_port" form="cfgCenterForm" type="number" min="1024" max="65000" />
-            </label>
-            <label>
-              <span class="field-title">
-                最大节点数
-                <button type="button" class="help-tip" aria-label="说明" data-tip="从订阅里最多加载多少个 VLESS 节点">?</button>
-              </span>
-              <input name="embedded_proxy_max_nodes" form="cfgCenterForm" type="number" min="1" max="500" />
-            </label>
-            <label>
-              <span class="field-title">
-                探测主机
-                <button type="button" class="help-tip" aria-label="说明" data-tip="预检连通性时访问的主机，默认 accounts.x.ai">?</button>
-              </span>
-              <input name="embedded_proxy_probe_host" form="cfgCenterForm" type="text" placeholder="accounts.x.ai" />
-            </label>
-            <label>
-              <span class="field-title">
-                探测端口
-                <button type="button" class="help-tip" aria-label="说明" data-tip="预检目标端口，默认 443">?</button>
-              </span>
-              <input name="embedded_proxy_probe_port" form="cfgCenterForm" type="number" min="1" max="65535" />
-            </label>
-            <label>
-              <span class="field-title">
-                探测超时(秒)
-                <button type="button" class="help-tip" aria-label="说明" data-tip="单节点预检超时">?</button>
-              </span>
-              <input name="embedded_proxy_probe_timeout_sec" form="cfgCenterForm" type="number" min="0.5" max="60" step="0.5" />
-            </label>
-          </div>
-          <div class="actions">
-            <button type="button" id="btnEmbeddedStart">启动/重载</button>
-            <button type="button" id="btnEmbeddedProbe">探测健康</button>
-            <button type="button" id="btnEmbeddedStop">停止</button>
-            <button type="button" id="btnEmbeddedStatus">刷新状态</button>
-          </div>
-          <p class="muted" id="embeddedProxySummary">状态: 未刷新</p>
-          <pre id="embeddedProxyStatus" class="box log">尚未查询</pre>
-        </section>
-
-        <section class="panel nested">
-          <h2>求解代理配置</h2>
-          <p class="muted">仅作用于 Turnstile 求解（CapSolver/2Captcha/YesCaptcha/local）。开启后求解请求独立走这里的代理，不跟注册出口绑死。</p>
-          <div class="form" id="turnstileProxyForm">
-            <label class="check">
-              <input type="checkbox" name="turnstile_proxy_enabled" form="cfgCenterForm" />
-              <span class="field-title">
-                启用求解专用代理
-                <button type="button" class="help-tip" aria-label="说明" data-tip="打开后求解不再复用注册代理；关闭则回退到注册出口/直连">?</button>
-              </span>
-            </label>
-            <label>
-              <span class="field-title">
-                求解代理模式
-                <button type="button" class="help-tip" aria-label="说明" data-tip="direct=单个代理；pool=从求解代理池抽取">?</button>
-              </span>
-              <select name="turnstile_proxy_mode" form="cfgCenterForm">
-                <option value="pool">代理池</option>
-                <option value="direct">直连代理</option>
-              </select>
-            </label>
-            <label>
-              <span class="field-title">
-                求解直连代理 URL
-                <button type="button" class="help-tip" aria-label="说明" data-tip="模式=直连时使用，如 http://user:pass@host:port">?</button>
-              </span>
-              <input name="turnstile_proxy" form="cfgCenterForm" type="text" placeholder="http://user:pass@host:port" />
-            </label>
-            <label>
-              <span class="field-title">
-                求解代理池文件
-                <button type="button" class="help-tip" aria-label="说明" data-tip="求解专用代理列表文件，默认 turnstile_proxies.txt">?</button>
-              </span>
-              <input name="turnstile_proxy_file" form="cfgCenterForm" type="text" placeholder="turnstile_proxies.txt" />
-            </label>
-            <label class="check">
-              <input type="checkbox" name="turnstile_proxy_random" form="cfgCenterForm" />
-              <span class="field-title">
-                求解池随机
-                <button type="button" class="help-tip" aria-label="说明" data-tip="从求解代理池随机挑一条">?</button>
-              </span>
-            </label>
-          </div>
-          <p class="muted" id="turnstilePoolMeta">求解代理池: -</p>
-        </section>
-
-        <section class="panel nested">
-          <h2>代理池内容</h2>
-          <p class="muted">注册侧 HTTP 代理池。一行一个代理。支持 host:port:user:pass 或 http://user:pass@host:port。</p>
-          <textarea id="proxyPoolText" class="pool" spellcheck="false"></textarea>
-          <h3>注册代理池 · 测试反馈</h3>
-          <p class="muted">由顶部「随机测试5条」触发；本池随机抽 5 条探测出口 IP。</p>
-          <pre id="proxyTestResult" class="box log">尚未测试</pre>
-        </section>
-
-        <section class="panel nested">
-          <h2>求解代理池内容</h2>
-          <p class="muted">求解专用代理池。开启“启用求解专用代理”且模式=代理池时生效。</p>
-          <textarea id="turnstileProxyPoolText" class="pool" spellcheck="false"></textarea>
-          <div class="actions">
-            <button type="button" id="btnSaveTurnstilePool">仅保存求解代理池</button>
-          </div>
-          <h3>求解代理池 · 测试反馈</h3>
-          <p class="muted">由顶部「随机测试5条」同步触发；本池随机抽 5 条探测出口 IP。</p>
-          <pre id="turnstileProxyTestResult" class="box log">尚未测试</pre>
-        </section>
+      <h2>配置分区</h2>
+      <p class="muted">配置中心已按功能拆开，避免单页过长。各分区共用「重载 / 保存配置」；改完记得保存。</p>
+      <div class="config-cards">
+        <a class="config-card" href="/config/mail">
+          <strong>邮箱 / 验证码</strong>
+          <span>邮箱源、Turnstile、微软邮箱池与分裂工具</span>
+        </a>
+        <a class="config-card" href="/config/output">
+          <strong>产物 / 推送</strong>
+          <span>OAuth 输出目录、Grok2API 远端、CPA 推送</span>
+        </a>
+        <a class="config-card" href="/config/proxy">
+          <strong>注册代理</strong>
+          <span>注册出口、代理池/订阅、内嵌 mihomo</span>
+        </a>
+        <a class="config-card" href="/config/turnstile">
+          <strong>求解代理</strong>
+          <span>Turnstile 专用代理与求解代理池</span>
+        </a>
       </div>
+    </section>
+    <section class="panel">
+      <h2>快捷说明</h2>
+      <ul class="muted tool-notes">
+        <li>运行参数仍在「运行台」调整；这里只管全局配置与池文件。</li>
+        <li>CPA 巡检台（号池浏览/探测）在主导航「CPA 巡检」；本处「CPA 推送」是把本地凭证上传到 CPA。</li>
+        <li>代理池「随机测试」按钮在注册代理 / 求解代理页顶部可用。</li>
+      </ul>
     </section>
 
   </main>
-  <script src="/static/config.js?v=tsproxy-persist-1"></script>
+  <script src="/static/config.js?v=config-secret-guard-3"></script>
 </body>
 </html>

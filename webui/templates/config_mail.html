@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>邮箱 / 验证码 · xAI HTTP</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/static/favicon.ico" sizes="any" />
+  <link rel="icon" href="/static/favicon-32.png" type="image/png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png" sizes="180x180" />
+  <link rel="stylesheet" href="/static/app.css?v=speed8-1" />
+</head>
+<body>
+  <header class="top">
+    <div class="top-main">
+      <div>
+        <h1>邮箱 / 验证码</h1>
+        <p class="muted">本机 {{ host }}:{{ port }} · 邮箱源 · Turnstile · 微软邮箱池</p>
+      </div>
+      <nav class="nav" aria-label="主导航">
+        <a href="/" class="{% if active == 'run' %}active{% endif %}">运行台</a>
+        <a href="/config" class="{% if active == 'config' %}active{% endif %}">配置中心</a>
+        <a href="/credentials" class="{% if active == 'credentials' %}active{% endif %}">凭证列表</a>
+        <a href="/cpa" class="{% if active == 'cpa' %}active{% endif %}">CPA 巡检</a>
+      </nav>
+      
+      <nav class="nav subnav" aria-label="配置分区">
+        <a href="/config" class="">总览</a>
+        <a href="/config/mail" class="active">邮箱 / 验证码</a>
+        <a href="/config/output" class="">产物 / 推送</a>
+        <a href="/config/proxy" class="">注册代理</a>
+        <a href="/config/turnstile" class="">求解代理</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="grid">
+<section class="panel wide">
+      <div class="actions" style="margin-top:0" data-config-page="mail">
+        <button type="button" id="btnReloadCfg">重载</button>
+        <button type="button" id="btnSaveCfg" class="primary">保存配置</button>
+        
+      </div>
+      <p id="cfgMsg" class="msg"></p>
+    </section><section class="panel">
+      <h2>邮箱 / Turnstile</h2>
+      <form id="cfgCenterForm" class="form">
+        <label>
+          <span class="field-title">
+            邮箱源
+            <button type="button" class="help-tip" aria-label="说明" data-tip="选临时邮箱服务商，决定用哪套邮箱配置">?</button>
+          </span>
+          <select name="email_provider">
+            <option value="yyds">yyds</option>
+            <option value="cloudflare">cloudflare</option>
+            <option value="duckmail">duckmail</option>
+            <option value="msgraph">msgraph/outlook</option>
+          </select>
+        </label>
+        <label>
+          <span class="field-title">
+            YYDS API Base
+            <button type="button" class="help-tip" aria-label="说明" data-tip="YYDS 接口地址，一般不用改默认值">?</button>
+          </span>
+          <input name="yyds_api_base" type="text" />
+        </label>
+        <label>
+          <span class="field-title">
+            YYDS API Key
+            <button type="button" class="help-tip" aria-label="说明" data-tip="YYDS 密钥；空=未配置，清空保存=删除">?</button>
+          </span>
+          <div class="secret-row">
+            <input name="yyds_api_key" type="text" placeholder="空=未配置" autocomplete="off" />
+          </div>
+          <span class="flag" data-flag="yyds_api_key"></span>
+        </label>
+        <label>
+          <span class="field-title">
+            YYDS JWT
+            <button type="button" class="help-tip" aria-label="说明" data-tip="YYDS 登录令牌；可与 API Key 二选一">?</button>
+          </span>
+          <div class="secret-row">
+            <input name="yyds_jwt" type="text" placeholder="空=未配置" autocomplete="off" />
+          </div>
+          <span class="flag" data-flag="yyds_jwt"></span>
+        </label>
+        <label>
+          <span class="field-title">
+            YYDS 建邮间隔(秒)
+            <button type="button" class="help-tip" aria-label="说明" data-tip="只限制创建邮箱请求的最小间隔。默认 1.5；接口允许更高吞吐时可调小，例如 0.05≈20/s，0=不额外限速（仍会走全局锁）">?</button>
+          </span>
+          <input name="yyds_create_spacing_sec" type="number" min="0" max="60" step="0.05" value="1.5" />
+        </label>
+        <label>
+          <span class="field-title">
+            Turnstile 提供商
+            <button type="button" class="help-tip" aria-label="说明" data-tip="验证码求解方式：本地浏览器或第三方">?</button>
+          </span>
+          <select name="turnstile_provider">
+            <option value="local">local</option>
+            <option value="capsolver">capsolver</option>
+            <option value="2captcha">2captcha</option>
+            <option value="yescaptcha">yescaptcha</option>
+          </select>
+        </label>
+        <label>
+          <span class="field-title">
+            Turnstile API Key
+            <button type="button" class="help-tip" aria-label="说明" data-tip="第三方求解服务的 Key；local 可留空">?</button>
+          </span>
+          <div class="secret-row">
+            <input name="turnstile_api_key" type="text" placeholder="空=未配置" autocomplete="off" />
+          </div>
+          <span class="flag" data-flag="turnstile_api_key"></span>
+        </label>
+        <label class="check">
+          <input type="checkbox" name="turnstile_headless" />
+          <span class="field-title">
+            Turnstile 无头
+            <button type="button" class="help-tip" aria-label="说明" data-tip="本地求解时尽量不弹窗（需 Xvfb 环境）">?</button>
+          </span>
+        </label>
+        <label>
+          <span class="field-title">
+            本地 Turnstile 并发上限
+            <button type="button" class="help-tip" aria-label="说明" data-tip="仅 local 生效；总并发仍受运行台与 128 上限约束">?</button>
+          </span>
+          <input name="local_turnstile_max_workers" type="number" min="1" max="6666" value="8" />
+        </label>
+        <label>
+          <span class="field-title">
+            本地同时过码数 inflight
+            <button type="button" class="help-tip" aria-label="说明" data-tip="真正限制同时开几个 Chrome 过码。想冲 8+/分钟建议 6~8；过高会互相抢资源">?</button>
+          </span>
+          <input name="local_turnstile_max_inflight" type="number" min="1" max="12" value="8" />
+        </label>
+        <label>
+          <span class="field-title">
+            Turnstile 单次超时(秒)
+            <button type="button" class="help-tip" aria-label="说明" data-tip="单次求解最长等待，默认 90；超时后可按重试次数再试">?</button>
+          </span>
+          <input name="turnstile_solve_timeout" type="number" min="5" max="600" value="90" />
+        </label>
+        <label>
+          <span class="field-title">
+            Turnstile 重试次数
+            <button type="button" class="help-tip" aria-label="说明" data-tip="含首次，默认 1。失败会结束该任务；需要捞单时可调到 2">?</button>
+          </span>
+          <input name="turnstile_solve_retries" type="number" min="1" max="10" value="1" />
+        </label>
+        <label>
+          <span class="field-title">
+            提交并发 submit_workers
+            <button type="button" class="help-tip" aria-label="说明" data-tip="注册提交阶段并发槽；默认 4，范围 1-32。Turnstile 解完后的提交会受这个限制">?</button>
+          </span>
+          <input name="submit_workers" type="number" min="1" max="128" value="4" />
+        </label>
+        <label>
+          <span class="field-title">
+            Cloudflare API Base
+            <button type="button" class="help-tip" aria-label="说明" data-tip="Cloudflare 临时邮箱 Worker 的 API 根地址">?</button>
+          </span>
+          <input name="cloudflare_api_base" type="text" />
+        </label>
+        <label>
+          <span class="field-title">
+            Cloudflare API Key
+            <button type="button" class="help-tip" aria-label="说明" data-tip="匿名模式留空；admin 模式填管理密码">?</button>
+          </span>
+          <div class="secret-row">
+            <input name="cloudflare_api_key" type="text" placeholder="空=未配置" autocomplete="off" />
+          </div>
+          <span class="flag" data-flag="cloudflare_api_key"></span>
+        </label>
+        <label>
+          <span class="field-title">
+            DuckMail API Key
+            <button type="button" class="help-tip" aria-label="说明" data-tip="DuckMail 服务密钥；选 duckmail 时必填">?</button>
+          </span>
+          <div class="secret-row">
+            <input name="duckmail_api_key" type="text" placeholder="空=未配置" autocomplete="off" />
+          </div>
+          <span class="flag" data-flag="duckmail_api_key"></span>
+        </label>
+        <label>
+          <span class="field-title">
+            MS 邮箱文件
+            <button type="button" class="help-tip" aria-label="说明" data-tip="Outlook 四段账号文件路径（msgraph 用）。下方可直接编辑池内容并保存。">?</button>
+          </span>
+          <input name="ms_mail_file" type="text" placeholder="need/outlook_mail.txt" />
+        </label>
+        <div class="ms-mail-block" id="msMailBlock">
+          <div class="ms-mail-head">
+            <h3>微软邮箱池（Graph）</h3>
+            <div class="ms-mail-actions">
+              <button type="button" id="btnOpenMsAlias" class="btn-secondary">分裂 / 回填工具</button>
+              <button type="button" id="btnSaveMsMailPool">仅保存邮箱池</button>
+            </div>
+          </div>
+          <p class="muted">
+            格式：<code>邮箱----密码----client_id----refresh_token</code>
+            （也支持冒号分隔；保存时会规范化为 ----）。邮箱源选 msgraph 时生效。
+          </p>
+          <p class="muted" id="msMailPoolMeta">微软邮箱池: -</p>
+          <textarea id="msMailPoolText" class="pool" spellcheck="false" placeholder="user@hotmail.com----password----00000000-0000-0000-0000-000000000000----M.C_xxx"></textarea>
+        </div>
+      </form>
+    </section>
+
+    <div class="tool-modal hidden" id="msAliasModal" aria-hidden="true">
+      <div class="tool-modal-card">
+        <div class="tool-modal-top">
+          <div>
+            <h3>微软邮箱 · 分裂 / 回填</h3>
+            <p class="muted" id="msAliasDesc">把主号拆成 +别名，一键回填到微软邮箱池。</p>
+          </div>
+          <button type="button" class="btn-flat" id="btnCloseMsAlias">关闭</button>
+        </div>
+        <div class="tool-grid">
+          <div>
+            <label class="field-title">输入（主号 / 池内容）</label>
+            <textarea id="msAliasSource" class="pool" spellcheck="false" placeholder="alice@hotmail.com----pass----client_id----refresh_token"></textarea>
+            <div class="tool-opts">
+              <label>每个邮箱生成数量
+                <input id="msAliasCount" type="number" min="1" max="20" value="5" />
+              </label>
+              <label class="check"><input type="checkbox" id="msAliasKeepFields" checked /> 保留密码/client_id/token</label>
+              <label class="check"><input type="checkbox" id="msAliasIncludePrimary" /> 额外输出主号</label>
+              <label class="check"><input type="checkbox" id="msAliasRemoveUsed" checked /> 生成后移除已处理行</label>
+              <label class="check"><input type="checkbox" id="msAliasStagger" checked /> 错开顺序输出</label>
+              <label>分裂规则
+                <select id="msAliasRule">
+                  <option value="random">随机 +abcdef</option>
+                  <option value="sequential">顺序 +1 +2 +3</option>
+                </select>
+              </label>
+            </div>
+            <div class="ms-mail-actions">
+              <button type="button" id="btnMsAliasGenerate">生成结果</button>
+              <button type="button" class="btn-flat" id="btnMsAliasColon">冒号转 ----</button>
+              <button type="button" class="btn-flat" id="btnMsAliasDemo">示例</button>
+              <button type="button" class="btn-flat" id="btnMsAliasClear">清空</button>
+            </div>
+          </div>
+  </main>
+  <script src="/static/config.js?v=speed8-1"></script>
+</body>
+</html>

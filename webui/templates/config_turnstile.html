@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>求解代理 · xAI HTTP</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/static/favicon.ico" sizes="any" />
+  <link rel="icon" href="/static/favicon-32.png" type="image/png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png" sizes="180x180" />
+  <link rel="stylesheet" href="/static/app.css?v=config-secret-guard-3" />
+</head>
+<body>
+  <header class="top">
+    <div class="top-main">
+      <div>
+        <h1>求解代理</h1>
+        <p class="muted">本机 {{ host }}:{{ port }} · Turnstile 专用代理池</p>
+      </div>
+      <nav class="nav" aria-label="主导航">
+        <a href="/" class="{% if active == 'run' %}active{% endif %}">运行台</a>
+        <a href="/config" class="{% if active == 'config' %}active{% endif %}">配置中心</a>
+        <a href="/credentials" class="{% if active == 'credentials' %}active{% endif %}">凭证列表</a>
+        <a href="/cpa" class="{% if active == 'cpa' %}active{% endif %}">CPA 巡检</a>
+      </nav>
+      
+      <nav class="nav subnav" aria-label="配置分区">
+        <a href="/config" class="">总览</a>
+        <a href="/config/mail" class="">邮箱 / 验证码</a>
+        <a href="/config/output" class="">产物 / 推送</a>
+        <a href="/config/proxy" class="">注册代理</a>
+        <a href="/config/turnstile" class="active">求解代理</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="grid">
+<section class="panel wide">
+      <div class="actions" style="margin-top:0" data-config-page="turnstile">
+        <button type="button" id="btnReloadCfg">重载</button>
+        <button type="button" id="btnSaveCfg" class="primary">保存配置</button>
+        <button type="button" id="btnTestPool" title="同步测试注册代理池与求解代理池，各随机 5 条">测试求解代理池</button>
+      </div>
+      <p id="cfgMsg" class="msg"></p>
+    </section>
+    <form id="cfgCenterForm" class="cfg-form">
+
+    <section class="panel wide">
+      <h2>求解代理</h2>
+      <p class="muted">仅作用于 Turnstile 求解。开启后求解请求独立走这里，不跟注册出口绑死。</p>
+      <div class="proxy-col proxy-col-ts">
+        
+          <div class="proxy-sub">
+            <h3>求解专用代理</h3>
+            <p class="muted">仅作用于 Turnstile 求解（CapSolver/2Captcha/YesCaptcha/local）。开启后求解请求独立走这里，不跟注册出口绑死；关闭则回退注册出口/直连。</p>
+            <div class="form" id="turnstileProxyForm">
+              <label class="check">
+                <input type="checkbox" name="turnstile_proxy_enabled" />
+                <span class="field-title">
+                  启用求解专用代理
+                  <button type="button" class="help-tip" aria-label="说明" data-tip="打开后求解不再复用注册代理；关闭则回退到注册出口/直连">?</button>
+                </span>
+              </label>
+              <label>
+                <span class="field-title">
+                  求解代理模式
+                  <button type="button" class="help-tip" aria-label="说明" data-tip="direct=固定代理 URL；pool=从求解代理池抽取">?</button>
+                </span>
+                <select name="turnstile_proxy_mode">
+                  <option value="pool">代理池</option>
+                  <option value="direct">固定代理 URL</option>
+                </select>
+              </label>
+              <label>
+                <span class="field-title">
+                  求解固定代理 URL
+                  <button type="button" class="help-tip" aria-label="说明" data-tip="模式=固定代理 URL 时使用，如 http://user:pass@host:port">?</button>
+                </span>
+                <input name="turnstile_proxy" type="text" placeholder="http://user:pass@host:port" />
+              </label>
+              <label>
+                <span class="field-title">
+                  求解代理池文件
+                  <button type="button" class="help-tip" aria-label="说明" data-tip="求解专用代理列表文件，默认 turnstile_proxies.txt">?</button>
+                </span>
+                <input name="turnstile_proxy_file" type="text" placeholder="turnstile_proxies.txt" />
+              </label>
+              <label class="check">
+                <input type="checkbox" name="turnstile_proxy_random" />
+                <span class="field-title">
+                  求解池随机
+                  <button type="button" class="help-tip" aria-label="说明" data-tip="从求解代理池随机挑一条">?</button>
+                </span>
+              </label>
+            </div>
+          </div>
+
+          <div class="proxy-sub">
+            <h3>求解代理池</h3>
+            <p class="muted">开启「启用求解专用代理」且模式=代理池时生效。</p>
+            <p class="muted" id="turnstilePoolMeta">求解代理池: -</p>
+            <textarea id="turnstileProxyPoolText" class="pool" spellcheck="false"></textarea>
+            <div class="actions">
+              <button type="button" id="btnSaveTurnstilePool">仅保存求解代理池</button>
+            </div>
+            <h4>求解代理池 · 测试反馈</h4>
+            <p class="muted">由顶部「随机测试5条(双池)」同步触发；本池随机抽 5 条探测出口 IP。</p>
+            <pre id="turnstileProxyTestResult" class="box log">尚未测试</pre>
+          </div>
+        
+      </div>
+    </section>
+
+</form>
+
+  </main>
+  <script src="/static/config.js?v=config-secret-guard-3"></script>
+</body>
+</html>

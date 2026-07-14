@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>产物 / 推送 · xAI HTTP</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/static/favicon.ico" sizes="any" />
+  <link rel="icon" href="/static/favicon-32.png" type="image/png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png" sizes="180x180" />
+  <link rel="stylesheet" href="/static/app.css?v=config-secret-guard-3" />
+</head>
+<body>
+  <header class="top">
+    <div class="top-main">
+      <div>
+        <h1>产物 / 推送</h1>
+        <p class="muted">本机 {{ host }}:{{ port }} · OAuth 输出 · Grok2API · CPA 推送</p>
+      </div>
+      <nav class="nav" aria-label="主导航">
+        <a href="/" class="{% if active == 'run' %}active{% endif %}">运行台</a>
+        <a href="/config" class="{% if active == 'config' %}active{% endif %}">配置中心</a>
+        <a href="/credentials" class="{% if active == 'credentials' %}active{% endif %}">凭证列表</a>
+        <a href="/cpa" class="{% if active == 'cpa' %}active{% endif %}">CPA 巡检</a>
+      </nav>
+      
+      <nav class="nav subnav" aria-label="配置分区">
+        <a href="/config" class="">总览</a>
+        <a href="/config/mail" class="">邮箱 / 验证码</a>
+        <a href="/config/output" class="active">产物 / 推送</a>
+        <a href="/config/proxy" class="">注册代理</a>
+        <a href="/config/turnstile" class="">求解代理</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="grid">
+<section class="panel wide">
+      <div class="actions" style="margin-top:0" data-config-page="output">
+        <button type="button" id="btnReloadCfg">重载</button>
+        <button type="button" id="btnSaveCfg" class="primary">保存配置</button>
+        
+      </div>
+      <p id="cfgMsg" class="msg"></p>
+    </section>
+    <form id="cfgCenterForm" class="cfg-form">
+<section class="panel">
+      <h2>产物与远端</h2>
+      <p class="muted">凭证写出目录与远端 grok2api 对接；与代理出口无关。</p>
+      <div class="form" id="outputForm">
+        <label>
+          <span class="field-title">
+            OAuth 输出目录
+            <button type="button" class="help-tip" aria-label="说明" data-tip="SSO/凭证 JSON 写出目录">?</button>
+          </span>
+          <input name="xai_oauth_output_dir" type="text" />
+        </label>
+        <label>
+          <span class="field-title">
+            Grok2API Remote Base
+            <button type="button" class="help-tip" aria-label="说明" data-tip="远端 grok2api 站点或管理 API 地址">?</button>
+          </span>
+          <input name="grok2api_remote_base" type="text" />
+        </label>
+        <label>
+          <span class="field-title">
+            Grok2API App Key
+            <button type="button" class="help-tip" aria-label="说明" data-tip="远端 grok2api 的 app key">?</button>
+          </span>
+          <div class="secret-row">
+            <input name="grok2api_remote_app_key" type="text" placeholder="空=未配置" autocomplete="off" />
+          </div>
+          <span class="flag" data-flag="grok2api_remote_app_key"></span>
+        </label>
+        <label>
+          <span class="field-title">
+            Grok2API Pool Name
+            <button type="button" class="help-tip" aria-label="说明" data-tip="写入远端时使用的 token 池名称（不是代理池）">?</button>
+          </span>
+          <input name="grok2api_pool_name" type="text" />
+        </label>
+      </div>
+    </section>
+<section class="panel wide" id="cpaPushPanel">
+      <h2>CPA 推送</h2>
+      <p class="muted">把本地 OAuth 输出目录中的凭证 JSON 推送到 CLIProxyAPI（CPA）管理接口。可先测连通，再批量推送；也可开启注册成功后自动推送。</p>
+      <div class="form" id="cpaPushForm">
+        <label>
+          <span class="field-title">
+            CPA 接口地址
+            <button type="button" class="help-tip" aria-label="说明" data-tip="只填根地址，例如 http://127.0.0.1:8317；不要带 /v0/management">?</button>
+          </span>
+          <input name="cpa_api_url" type="text" placeholder="http://127.0.0.1:8317" autocomplete="off" />
+        </label>
+        <label>
+          <span class="field-title">
+            CPA 管理密钥
+            <button type="button" class="help-tip" aria-label="说明" data-tip="CPA management secret_key，请求头 Bearer 鉴权">?</button>
+          </span>
+          <div class="secret-row">
+            <input name="cpa_api_key" type="password" placeholder="空=未配置" autocomplete="off" />
+          </div>
+          <span class="flag" data-flag="cpa_api_key"></span>
+        </label>
+        <label class="check">
+          <input name="cpa_auto_upload" type="checkbox" />
+          注册成功后自动推送到 CPA
+        </label>
+        <label class="check">
+          <input name="cpa_use_local_name" type="checkbox" checked />
+          上传时账户名跟本地文件名一致
+        </label>
+        <label class="check">
+          <input name="cpa_skip_duplicates" type="checkbox" checked />
+          跳过远端重复凭证（同名 / 同 provider+email）
+        </label>
+      </div>
+      <div class="actions" style="margin-top:10px">
+        <button type="button" id="btnCpaTest" class="primary">测试推送连接</button>
+        <button type="button" id="btnCpaPush">推送本地凭证到 CPA</button>
+        <button type="button" id="btnCpaSaveHint" title="会随「保存配置」一并写入">保存配置时生效</button>
+      </div>
+      <p id="cpaPushMsg" class="msg"></p>
+      <pre id="cpaPushResult" class="box small">等待操作…</pre>
+    </section>
+</form>
+
+  </main>
+  <script src="/static/config.js?v=config-secret-guard-3"></script>
+</body>
+</html>

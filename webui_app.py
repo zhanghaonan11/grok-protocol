@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Localhost WebUI for HTTP batch registration (default 127.0.0.1:33843)."""
+"""Localhost WebUI for HTTP batch registration (default 127.0.0.1:33844)."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from http_batch_service import (
 )
 
 DEFAULT_WEBUI_HOST = "127.0.0.1"
-DEFAULT_WEBUI_PORT = 33843
+DEFAULT_WEBUI_PORT = 33844
 
 _APP_SERVICE: Optional[BatchService] = None
 _POLL_THREAD: Optional[threading.Thread] = None
@@ -147,6 +147,14 @@ def _slim_run_snapshot(snap: Optional[Dict[str, Any]], *, worker_limit: int = 16
         "avg_success_per_min": snap.get("avg_success_per_min"),
         "success_rate": snap.get("success_rate"),
         "failure_counts": snap.get("failure_counts") or {},
+        "refill_paused": snap.get("refill_paused"),
+        "refill_pause_reason": snap.get("refill_pause_reason"),
+        "pause_reason": snap.get("pause_reason") or snap.get("refill_pause_reason"),
+        "circuit_open": snap.get("circuit_open"),
+        "proxy_unhealthy": snap.get("proxy_unhealthy"),
+        "recent_fail_count": snap.get("recent_fail_count"),
+        "recent_total": snap.get("recent_total"),
+        "recent_fail_rate": snap.get("recent_fail_rate"),
         "worker_total": len(workers),
         "workers_truncated": max(0, len(workers) - len(slim_workers)),
         "workers": slim_workers,
@@ -163,12 +171,24 @@ def _ensure_poller(service: BatchService) -> None:
             try:
                 service.poll()
             except Exception:
+                # Keep the poller alive; a single tick failure must not freeze the batch.
                 pass
             time.sleep(0.4)
 
     _POLL_STOP.clear()
     _POLL_THREAD = threading.Thread(target=_loop, name="batch-poller", daemon=True)
     _POLL_THREAD.start()
+
+
+def _poll_and_snapshot(service: BatchService | None = None) -> Optional[Dict[str, Any]]:
+    """Ensure poller is running, advance one tick, then return current snapshot."""
+    svc = service or get_service()
+    _ensure_poller(svc)
+    try:
+        svc.poll()
+    except Exception:
+        pass
+    return svc.current_snapshot()
 
 
 def create_app(service: Optional[BatchService] = None) -> FastAPI:
@@ -191,6 +211,15 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
     templates_dir = ROOT_DIR / "webui" / "templates"
     static_dir.mkdir(parents=True, exist_ok=True)
     templates_dir.mkdir(parents=True, exist_ok=True)
+
+    # 先挂更具体的 /static/cpa，再挂通用 /static，避免被前缀吞掉
+    try:
+        from cpa_inspector.web.app import attach_cpa
+
+        attach_cpa(app)
+    except Exception as exc:  # pragma: no cover - 启动期兜底，避免巡检模块拖垮主 UI
+        print(f"[!] CPA 巡检模块未挂载: {exc}")
+
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     class NoCacheStaticMiddleware:
@@ -238,13 +267,41 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
     def config_page(request: Request) -> HTMLResponse:
         return _page(request, "config.html", "config")
 
+    @app.get("/config/mail", response_class=HTMLResponse)
+    def config_mail_page(request: Request) -> HTMLResponse:
+        return _page(request, "config_mail.html", "config")
+
+    @app.get("/config/output", response_class=HTMLResponse)
+    def config_output_page(request: Request) -> HTMLResponse:
+        return _page(request, "config_output.html", "config")
+
+    @app.get("/config/proxy", response_class=HTMLResponse)
+    def config_proxy_page(request: Request) -> HTMLResponse:
+        return _page(request, "config_proxy.html", "config")
+
+    @app.get("/config/turnstile", response_class=HTMLResponse)
+    def config_turnstile_page(request: Request) -> HTMLResponse:
+        return _page(request, "config_turnstile.html", "config")
+
     @app.get("/credentials", response_class=HTMLResponse)
     def credentials_page(request: Request) -> HTMLResponse:
         return _page(request, "credentials.html", "credentials")
 
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon_ico() -> FileResponse:
+        """Browsers probe /favicon.ico by default; serve the project icon."""
+        path = ROOT_DIR / "webui" / "static" / "favicon.ico"
+        return FileResponse(path, media_type="image/x-icon")
+
     @app.get("/api/health")
     def health() -> Dict[str, Any]:
         svc = get_service()
+        if svc.is_busy():
+            _ensure_poller(svc)
+            try:
+                svc.poll()
+            except Exception:
+                pass
         snap = svc.current_snapshot()
         try:
             emb = _compact_embedded_proxy_status(svc.get_embedded_proxy_status())
@@ -289,6 +346,22 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
             return get_service().update_config_center(payload or {})
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
+
+    @app.post("/api/cpa-push/test")
+    def cpa_push_test(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Test CPA management connectivity with saved or override credentials."""
+        try:
+            return get_service().check_cpa_connection(payload or {})
+        except TuiConfigError as exc:
+            raise _err(exc) from exc
+
+    @app.post("/api/cpa-push/upload")
+    def cpa_push_upload(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Push local OAuth credential JSON files to CPA."""
+        try:
+            return get_service().push_cpa_credentials(payload or {})
+        except TuiConfigError as exc:
+            raise _err(exc) from exc
 
     @app.get("/api/credentials")
     def credentials_list(
@@ -403,10 +476,38 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
 
+    @app.get("/api/ms-mail-pool")
+    def ms_mail_pool_get() -> Dict[str, Any]:
+        try:
+            return get_service().get_ms_mail_pool()
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+
+    @app.put("/api/ms-mail-pool")
+    def ms_mail_pool_put(payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            text_value = ""
+            if isinstance(payload, dict):
+                text_value = str(
+                    payload.get("text")
+                    if "text" in payload
+                    else payload.get("ms_mail_pool_text") or ""
+                )
+            return get_service().set_ms_mail_pool(text_value)
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+
     @app.post("/api/proxy-pool/import-subscription")
     def proxy_pool_import_subscription(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         data = dict(payload or {})
         url = str(data.get("url") or data.get("proxy_subscription_url") or "").strip()
+        urls = data.get("urls")
+        if urls is None:
+            urls = data.get("proxy_subscription_urls")
         write_pool = True if data.get("write_pool") is None else bool(data.get("write_pool"))
         timeout = float(data.get("timeout") or 20)
         use_local = True if data.get("use_local_http_if_empty") is None else bool(data.get("use_local_http_if_empty"))
@@ -418,10 +519,41 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
         try:
             return get_service().import_proxy_subscription(
                 url=url,
+                urls=urls,
                 write_pool=write_pool,
                 timeout=timeout,
                 use_local_http_if_empty=use_local,
                 local_http=local_http,
+            )
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+
+    @app.post("/api/proxy-pool/import-clean-embedded")
+    def proxy_pool_import_clean_embedded(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        data = dict(payload or {})
+        write_pool = bool(data.get("write_pool") or False)
+        try:
+            return get_service().import_clean_embedded_proxy_list(write_pool=write_pool)
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+
+    @app.post("/api/embedded-proxy/export-to-pool")
+    def embedded_proxy_export_to_pool(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        data = dict(payload or {})
+        healthy_only = True if data.get("healthy_only") is None else bool(data.get("healthy_only"))
+        switch_to_manual = True if data.get("switch_to_manual") is None else bool(data.get("switch_to_manual"))
+        set_proxy_mode = str(data.get("set_proxy_mode") or "pool")
+        keep_embedded = True if data.get("keep_embedded_enabled") is None else bool(data.get("keep_embedded_enabled"))
+        try:
+            return get_service().export_embedded_nodes_to_proxy_pool(
+                healthy_only=healthy_only,
+                switch_to_manual=switch_to_manual,
+                set_proxy_mode=set_proxy_mode,
+                keep_embedded_enabled=keep_embedded,
             )
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
@@ -543,6 +675,54 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
 
+    @app.get("/api/embedded-proxy/node-cache")
+    def embedded_proxy_node_cache_get() -> Dict[str, Any]:
+        try:
+            return get_service().get_embedded_node_cache_text()
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+
+    @app.put("/api/embedded-proxy/node-cache")
+    def embedded_proxy_node_cache_put(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        data = dict(payload or {})
+        text_value = str(data.get("text") if "text" in data else data.get("node_cache_text") or "")
+        try:
+            return get_service().set_embedded_node_cache_text(text_value)
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+
+    @app.delete("/api/embedded-proxy/node-cache")
+    def embedded_proxy_node_cache_delete() -> Dict[str, Any]:
+        try:
+            return get_service().clear_embedded_node_cache()
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+
+    @app.post("/api/embedded-proxy/fetch-subscription")
+    def embedded_proxy_fetch_subscription(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        data = dict(payload or {})
+        url = str(data.get("url") or data.get("proxy_subscription_url") or "").strip()
+        urls = data.get("urls")
+        if urls is None:
+            urls = data.get("proxy_subscription_urls")
+        timeout = float(data.get("timeout") or 20)
+        try:
+            return get_service().fetch_embedded_subscription_nodes(
+                url=url,
+                urls=urls,
+                timeout=timeout,
+            )
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
+            raise _err(exc, 400) from exc
+
     @app.get("/api/browser/health")
     def browser_health() -> Dict[str, Any]:
         status = browser_health_status()
@@ -574,7 +754,7 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
 
     @app.get("/api/runs/current")
     def runs_current() -> Dict[str, Any]:
-        snap = get_service().current_snapshot()
+        snap = _poll_and_snapshot()
         if snap is None:
             return {"run": None}
         return {"run": _slim_run_snapshot(snap)}
