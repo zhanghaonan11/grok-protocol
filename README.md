@@ -56,6 +56,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - [运行](#运行)
 - [无浏览器 HTTP 模式](#无浏览器-http-模式)
 - [完整使用指南](#完整使用指南)
+- [手动执行：注册 / 转换 / 上传 CPA](手动执行.md)
 - [输出文件](#输出文件)
 - [稳定性机制](#稳定性机制)
 - [常见问题](#常见问题)
@@ -317,6 +318,10 @@ python grok_register_ttk.py http credential --sso-file sso.txt --output-dir xai_
 
 **→ [USAGE.md](USAGE.md)**
 
+分步手动操作（注册 → SSO 转 JSON → 上传 CPA）见：
+
+**→ [手动执行.md](手动执行.md)**
+
 ### GUI 模式
 
 ```bash
@@ -371,6 +376,7 @@ GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `r
 ├── need/                  # 仅示例；真实池文件勿提交
 ├── tests/
 ├── USAGE.md               # 完整使用指南（人类 + AI）
+├── 手动执行.md             # 注册 / 转换 JSON / 上传 CPA 手动命令
 ├── requirements.txt
 └── README.md
 ```
