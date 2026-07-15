@@ -68,15 +68,15 @@ function fill(data) {
   set("turnstile_headless", !!f.turnstile_headless, true);
   set(
     "local_turnstile_max_workers",
-    f.local_turnstile_max_workers == null ? 8 : f.local_turnstile_max_workers
+    f.local_turnstile_max_workers == null ? 3 : f.local_turnstile_max_workers
   );
   set(
     "local_turnstile_max_inflight",
-    f.local_turnstile_max_inflight == null ? 8 : f.local_turnstile_max_inflight
+    f.local_turnstile_max_inflight == null ? 3 : f.local_turnstile_max_inflight
   );
   set(
     "submit_workers",
-    f.submit_workers == null ? 8 : f.submit_workers
+    f.submit_workers == null ? 4 : f.submit_workers
   );
   set(
     "turnstile_solve_timeout",
@@ -224,9 +224,9 @@ function collectFields() {
   put("turnstile_provider", g("turnstile_provider"));
   putSecret("turnstile_api_key");
   if (present("turnstile_headless")) put("turnstile_headless", g("turnstile_headless", true));
-  if (present("local_turnstile_max_workers")) put("local_turnstile_max_workers", Number(g("local_turnstile_max_workers") || 8));
-  if (present("local_turnstile_max_inflight")) put("local_turnstile_max_inflight", Number(g("local_turnstile_max_inflight") || 8));
-  if (present("submit_workers")) put("submit_workers", Number(g("submit_workers") || 8));
+  if (present("local_turnstile_max_workers")) put("local_turnstile_max_workers", Number(g("local_turnstile_max_workers") || 3));
+  if (present("local_turnstile_max_inflight")) put("local_turnstile_max_inflight", Number(g("local_turnstile_max_inflight") || 3));
+  if (present("submit_workers")) put("submit_workers", Number(g("submit_workers") || 4));
   if (present("turnstile_solve_timeout")) put("turnstile_solve_timeout", Number(g("turnstile_solve_timeout") || 90));
   if (present("turnstile_solve_retries")) put("turnstile_solve_retries", Number(g("turnstile_solve_retries") || 1));
   put("cloudflare_api_base", g("cloudflare_api_base"));

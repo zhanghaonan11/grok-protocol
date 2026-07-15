@@ -59,23 +59,23 @@
         <label id="countField">注册数量 <input type="number" name="count" min="1" max="99999999" value="1" /></label>
         <label id="targetSuccessField" style="display:none">成功目标(0=不限) <input type="number" name="target_success" min="0" max="99999999" value="0" /></label>        <label>并发数 <input type="number" name="workers" min="1" max="128" value="8" /></label>
         <label>同时过码数
-          <input type="number" name="local_turnstile_max_inflight" min="1" max="12" value="6" title="真正同时开几个浏览器过码" />
+          <input type="number" name="local_turnstile_max_inflight" min="1" max="12" value="3" title="真正同时开几个浏览器过码；16GB 机器建议 3" />
         </label>
         <label>过码超时(秒)
-          <input type="number" name="turnstile_solve_timeout" min="5" max="600" value="30" />
+          <input type="number" name="turnstile_solve_timeout" min="5" max="600" value="90" />
         </label>
         <label>过码重试
           <input type="number" name="turnstile_solve_retries" min="1" max="10" value="1" />
         </label>
         <label>提交并发
-          <input type="number" name="submit_workers" min="1" max="128" value="8" />
+          <input type="number" name="submit_workers" min="1" max="128" value="4" />
         </label>
         <label>等邮件超时(秒)
           <input type="number" name="mail_code_timeout_sec" min="10" max="180" value="40" title="邮箱验证码最长等待，超时快速换号" />
         </label>
         <div class="actions" style="margin:0;grid-column:1/-1">
-          <button type="button" id="btnSpeedPreset8" class="btn-secondary" title="一键套用冲 8+/分钟参数">套用 8+/分钟参数</button>
-          <span class="muted" id="speedPresetHint">建议：并发8 · 同时过码6 · 过码30s · 等邮件40s · 节点健康≥4可跑，≥8更稳</span>
+          <button type="button" id="btnSpeedPreset8" class="btn-secondary" title="套用适合 16GB 本机的稳健流水线参数">本地稳健加速</button>
+          <span class="muted" id="speedPresetHint">并发8 跑邮箱/OTP/OAuth · 同时只开3个浏览器过码 · 保留当前出口和目标模式</span>
         </div>
         <div class="ms-target-row" id="msTargetRow">
           <button type="button" id="btnFillMsMailCount" class="btn-secondary" title="读取配置中心微软邮箱池有效行数，填入当前目标数量">
@@ -151,6 +151,6 @@
       <pre id="historyDetail" class="box log"></pre>
     </section>
   </main>
-  <script src="/static/app.js?v=speed8-2"></script>
+  <script src="/static/app.js?v=local-pipeline-1"></script>
 </body>
 </html>

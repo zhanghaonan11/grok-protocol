@@ -39,6 +39,11 @@ class HttpBatchServiceSmokeTests(unittest.TestCase):
             # Account concurrency is independent; only Turnstile browser slots are capped.
             self.assertEqual(plan.workers, 10)
             self.assertLessEqual(plan.turnstile_workers, svc.MAX_LOCAL_TURNSTILE_WORKERS)
+            self.assertEqual(
+                plan.local_turnstile_max_inflight,
+                svc.DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT,
+            )
+            self.assertTrue(any("流水线并发 10" in w for w in plan.warnings))
 
     def test_build_plan_local_uses_configured_cap(self):
         with tempfile.TemporaryDirectory() as d:
@@ -54,6 +59,7 @@ class HttpBatchServiceSmokeTests(unittest.TestCase):
                         "register_count": 10,
                         "concurrent_workers": 10,
                         "local_turnstile_max_workers": 8,
+                        "local_turnstile_max_inflight": 3,
                     }
                 ),
                 encoding="utf-8",
@@ -71,7 +77,8 @@ class HttpBatchServiceSmokeTests(unittest.TestCase):
             plan = svc.build_plan(settings)
             self.assertEqual(plan.workers, 10)
             self.assertEqual(plan.turnstile_workers, 8)
-            self.assertTrue(any("local_turnstile_max_workers" in w for w in plan.warnings))
+            self.assertEqual(plan.local_turnstile_max_inflight, 3)
+            self.assertTrue(any("最多同时过码 3 路" in w for w in plan.warnings))
             self.assertTrue(any("YYDS" in w for w in plan.warnings))
             self.assertFalse(
                 any(("限制为" in w and "YYDS" in w) for w in plan.warnings),

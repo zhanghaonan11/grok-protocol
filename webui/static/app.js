@@ -122,11 +122,11 @@ function formData() {
     target_success: Number(fd.get("target_success") || 0),
     count: Number(fd.get("count") || 1),
     workers: Number(fd.get("workers") || 1),
-    local_turnstile_max_inflight: Number(fd.get("local_turnstile_max_inflight") || 8),
-    local_turnstile_max_workers: Number(fd.get("local_turnstile_max_inflight") || fd.get("local_turnstile_max_workers") || 8),
-    turnstile_solve_timeout: Number(fd.get("turnstile_solve_timeout") || 35),
+    local_turnstile_max_inflight: Number(fd.get("local_turnstile_max_inflight") || 3),
+    local_turnstile_max_workers: Number(fd.get("local_turnstile_max_inflight") || fd.get("local_turnstile_max_workers") || 3),
+    turnstile_solve_timeout: Number(fd.get("turnstile_solve_timeout") || 90),
     turnstile_solve_retries: Number(fd.get("turnstile_solve_retries") || 1),
-    submit_workers: Number(fd.get("submit_workers") || 8),
+    submit_workers: Number(fd.get("submit_workers") || 4),
     mail_code_timeout_sec: Number(fd.get("mail_code_timeout_sec") || 40),
     egress_mode: fd.get("egress_mode") || "auto",
     output_dir: fd.get("output_dir"),
@@ -152,18 +152,18 @@ function fillForm(data) {
   form.workers.value = data.workers || 1;
   if (form.local_turnstile_max_inflight) {
     form.local_turnstile_max_inflight.value =
-      data.local_turnstile_max_inflight != null ? data.local_turnstile_max_inflight : 6;
+      data.local_turnstile_max_inflight != null ? data.local_turnstile_max_inflight : 3;
   }
   if (form.turnstile_solve_timeout) {
     form.turnstile_solve_timeout.value =
-      data.turnstile_solve_timeout != null ? data.turnstile_solve_timeout : 30;
+      data.turnstile_solve_timeout != null ? data.turnstile_solve_timeout : 90;
   }
   if (form.turnstile_solve_retries) {
     form.turnstile_solve_retries.value =
       data.turnstile_solve_retries != null ? data.turnstile_solve_retries : 1;
   }
   if (form.submit_workers) {
-    form.submit_workers.value = data.submit_workers != null ? data.submit_workers : 8;
+    form.submit_workers.value = data.submit_workers != null ? data.submit_workers : 4;
   }
   if (form.mail_code_timeout_sec) {
     form.mail_code_timeout_sec.value =
@@ -611,23 +611,19 @@ $("btnRefreshHistory").onclick = () => refreshHistory().catch(e => setMsg(String
 if ($("btnSpeedPreset8")) {
   $("btnSpeedPreset8").onclick = () => {
     if (form.workers) form.workers.value = 8;
-    if (form.local_turnstile_max_inflight) form.local_turnstile_max_inflight.value = 6;
-    if (form.turnstile_solve_timeout) form.turnstile_solve_timeout.value = 30;
+    if (form.local_turnstile_max_inflight) form.local_turnstile_max_inflight.value = 3;
+    if (form.turnstile_solve_timeout) form.turnstile_solve_timeout.value = 90;
     if (form.turnstile_solve_retries) form.turnstile_solve_retries.value = 1;
-    if (form.submit_workers) form.submit_workers.value = 8;
+    if (form.submit_workers) form.submit_workers.value = 4;
     if (form.mail_code_timeout_sec) form.mail_code_timeout_sec.value = 40;
     if (form.turnstile_provider) form.turnstile_provider.value = "local";
-    if (form.turnstile_headless) form.turnstile_headless.checked = true;
-    if (form.egress_mode) {
-      form.egress_mode.value = "nodes";
-      syncEgressModeHint();
-    }
-    if (form.target_mode) form.target_mode.value = "continuous";
-    if (form.target_success) form.target_success.value = 0;
+    // The latest successful local batches use headed capture. Keep the user's
+    // egress and target mode instead of silently switching workflows.
+    if (form.turnstile_headless) form.turnstile_headless.checked = false;
     syncTargetModeFields();
     const hint = $("speedPresetHint");
-    if (hint) hint.textContent = "已套用：并发8 · 同时过码6 · 过码30s · 等邮件40s · 提交8 · 只用节点池。记得保存/开始";
-    setMsg("已套用 8+/分钟参数（请保存运行参数，并确保节点健康数≥8）");
+    if (hint) hint.textContent = "已套用：并发8 · 同时过码3 · 有界面 · 过码90s · 提交4；出口和目标模式未改。记得保存/开始";
+    setMsg("已套用本地稳健加速参数（请保存运行参数）");
   };
 }
 if ($("btnRefreshEgressStatus")) {

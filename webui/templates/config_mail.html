@@ -125,14 +125,14 @@
             本地 Turnstile 并发上限
             <button type="button" class="help-tip" aria-label="说明" data-tip="仅 local 生效；总并发仍受运行台与 128 上限约束">?</button>
           </span>
-          <input name="local_turnstile_max_workers" type="number" min="1" max="6666" value="8" />
+          <input name="local_turnstile_max_workers" type="number" min="1" max="6666" value="3" />
         </label>
         <label>
           <span class="field-title">
             本地同时过码数 inflight
-            <button type="button" class="help-tip" aria-label="说明" data-tip="真正限制同时开几个 Chrome 过码。想冲 8+/分钟建议 6~8；过高会互相抢资源">?</button>
+            <button type="button" class="help-tip" aria-label="说明" data-tip="真正限制同时开几个 Chrome 过码。16GB 机器建议 3；账号并发可设 8，让邮箱、OTP 和 OAuth 流水线并行">?</button>
           </span>
-          <input name="local_turnstile_max_inflight" type="number" min="1" max="12" value="8" />
+          <input name="local_turnstile_max_inflight" type="number" min="1" max="12" value="3" />
         </label>
         <label>
           <span class="field-title">

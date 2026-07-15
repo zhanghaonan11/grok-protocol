@@ -106,6 +106,8 @@ class WebUIAppTests(unittest.TestCase):
             mail = client.get("/config/mail")
             self.assertEqual(mail.status_code, 200)
             self.assertIn('name="local_turnstile_max_workers"', mail.text)
+            self.assertIn('name="local_turnstile_max_inflight"', mail.text)
+            self.assertIn('name="local_turnstile_max_inflight" type="number" min="1" max="12" value="3"', mail.text)
             self.assertIn('name="submit_workers"', mail.text)
             self.assertIn('name="yyds_create_spacing_sec"', mail.text)
             self.assertIn('class="help-tip"', mail.text)
@@ -509,6 +511,9 @@ class WebUIAppTests(unittest.TestCase):
             self.assertEqual(page.status_code, 200)
             self.assertIn('id="liveLogs"', page.text)
             self.assertIn("默认关闭实时日志", page.text)
+            self.assertIn("本地稳健加速", page.text)
+            self.assertIn('name="local_turnstile_max_inflight" min="1" max="12" value="3"', page.text)
+            self.assertIn('name="turnstile_solve_timeout" min="5" max="600" value="90"', page.text)
             # live logs checkbox should not be pre-checked
             self.assertNotIn('id="liveLogs" checked', page.text)
 

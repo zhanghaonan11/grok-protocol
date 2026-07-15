@@ -131,9 +131,10 @@ cp config.example.json config.json
 
 | 字段 / 环境变量 | 说明 |
 | --- | --- |
-| `turnstile_provider` | `yescaptcha` \| `capsolver` \| `2captcha` |
+| `turnstile_provider` | `local` \| `yescaptcha` \| `capsolver` \| `2captcha` |
 | `turnstile_api_key` | 求解服务 key |
-| `local_turnstile_max_workers` | 本地浏览器 Turnstile 并发上限（默认 3，范围 1~6666；仅 `turnstile_provider=local` 生效） |
+| `local_turnstile_max_workers` | 本地 Turnstile 求解 worker 上限（默认 3；仅 `turnstile_provider=local` 生效） |
+| `local_turnstile_max_inflight` | 跨进程同时开启的本地浏览器数（默认 3，范围 1~12）；16GB 机器建议账号并发 8、过码并发 3，让邮箱/OTP/OAuth 与过码形成流水线 |
 | `XAI_TURNSTILE_PROVIDER` | 环境变量覆盖 provider |
 | `XAI_TURNSTILE_API_KEY` | 环境变量覆盖 key |
 | `CAPSOLVER_API_KEY` | `turnstile_provider=capsolver` 时的专用 key |

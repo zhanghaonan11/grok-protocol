@@ -2853,7 +2853,7 @@ _LOCAL_TURNSTILE_SLOT_DIR = Path(
     os.environ.get("XAI_LOCAL_TURNSTILE_SLOT_DIR")
     or (Path(tempfile.gettempdir()) / "xai-local-turnstile-slots")
 )
-DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT = 2
+DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT = 3
 MIN_LOCAL_TURNSTILE_MAX_INFLIGHT = 1
 MAX_LOCAL_TURNSTILE_MAX_INFLIGHT = 12
 
@@ -2891,7 +2891,7 @@ def resolve_local_turnstile_max_inflight(
       1) env XAI_LOCAL_TURNSTILE_MAX_INFLIGHT
       2) config.local_turnstile_max_inflight
       3) config.local_turnstile_max_workers (legacy alias)
-      4) default 2
+      4) default 3
     """
     env_raw = str(os.environ.get("XAI_LOCAL_TURNSTILE_MAX_INFLIGHT") or "").strip()
     cfg = config if isinstance(config, dict) else None

@@ -55,6 +55,7 @@ MIN_LOCAL_TURNSTILE_WORKERS = 1
 ABS_MAX_LOCAL_TURNSTILE_WORKERS = 6666
 DEFAULT_TURNSTILE_QUEUE_SIZE = 64
 DEFAULT_SUBMIT_WORKERS = 4
+DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT = 3
 MAX_LOG_LINES = 700
 DEFAULT_SSO_CONVERT_RETRIES = 5
 DEFAULT_SSO_CONVERT_COOLDOWN = 3
@@ -433,6 +434,7 @@ class RunPlan:
     turnstile_workers: int = 1
     turnstile_queue_size: int = DEFAULT_TURNSTILE_QUEUE_SIZE
     submit_workers: int = DEFAULT_SUBMIT_WORKERS
+    local_turnstile_max_inflight: int = DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT
     turnstile_broker_url: str = ""
     manage_turnstile_broker: bool = False
     sso_convert_retries: int = DEFAULT_SSO_CONVERT_RETRIES
@@ -1014,9 +1016,9 @@ def resolve_local_turnstile_max_inflight_cfg(config: object = None, *, strict: b
             if raw is None or str(raw).strip() == "":
                 raw = config.get("local_turnstile_max_workers")
         try:
-            value = int(float(raw if raw is not None else 2))
+            value = int(float(raw if raw is not None else DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT))
         except Exception:
-            value = 2
+            value = DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT
         return max(1, min(12, value))
     return int(resolve_local_turnstile_max_inflight(config if isinstance(config, dict) else None, strict=strict))
 
@@ -1328,7 +1330,7 @@ def build_plan(settings: Settings) -> RunPlan:
                 f"缺少 {TURNSTILE_PROVIDER_LABELS[provider]} API 密钥。请设置 config.turnstile_api_key 或对应环境变量。"
             )
     elif provider == "local":
-        local_cap = resolve_local_turnstile_max_workers(config, strict=False)
+        local_inflight = resolve_local_turnstile_max_inflight_cfg(config, strict=False)
         warnings.append(
             "主流程仍是 HTTP 协议；仅在 Turnstile 求解阶段临时打开本地浏览器"
             + ("（无头）" if turnstile_headless else "（有界面）")
@@ -1336,18 +1338,21 @@ def build_plan(settings: Settings) -> RunPlan:
         )
         warnings.append(
             "本地 Turnstile 使用「每任务独立求解」（不走共享 broker），"
-            "与已验证成功的无头 batch 路径一致。"
+            "与已验证成功的 batch 路径一致。"
         )
-        if turnstile_headless:
+        warnings.append(
+            f"流水线并发 {workers}：邮箱/OTP/OAuth 可并行，"
+            f"本地浏览器最多同时过码 {local_inflight} 路。"
+        )
+        if workers == 1 and local_inflight > 1:
             warnings.append(
-                "本地无头会映射为 virtual-headed（Xvfb）；"
-                f"建议账号并发 ≤ {local_cap}"
-                "（配置 concurrent_workers / local_turnstile_max_workers）。"
+                "账号并发为 1，无法利用多个本地过码槽；"
+                "可在运行台使用「本地稳健加速」预设。"
             )
-        if workers > local_cap:
+        if local_inflight >= 6:
             warnings.append(
-                f"账号并发 {workers} 高于本地 Turnstile 建议上限 {local_cap}；"
-                "高并发可能抢占浏览器/代理资源导致超时。"
+                f"本地同时过码数为 {local_inflight}；多路 Chrome 可能争抢内存/CPU，"
+                "16GB 机器建议先用 3。"
             )
 
     is_graph = email_provider in {"msgraph", "microsoft", "hotmail", "outlook"}
@@ -1373,6 +1378,7 @@ def build_plan(settings: Settings) -> RunPlan:
 
     proxy_mode, proxy_args = _resolve_proxy_args(settings)
     local_cap = resolve_local_turnstile_max_workers(config, strict=False)
+    local_inflight = resolve_local_turnstile_max_inflight_cfg(config, strict=False)
     requested_turnstile_workers = int(
         settings.turnstile_workers
         or config.get("turnstile_workers")
@@ -1463,6 +1469,7 @@ def build_plan(settings: Settings) -> RunPlan:
         turnstile_workers=turnstile_workers,
         turnstile_queue_size=turnstile_queue_size,
         submit_workers=submit_workers,
+        local_turnstile_max_inflight=local_inflight,
         turnstile_broker_url=turnstile_broker_url,
         # Local provider: never auto-start shared broker. Only use broker when the
         # user/config explicitly provided turnstile_broker_url.
@@ -1494,6 +1501,8 @@ def describe_plan(plan: RunPlan, *, dry_run: bool = False) -> str:
         f"代理: {_egress_mode_label(encode_egress_mode(plan.proxy_mode, plan.embedded_proxy_enabled))} ({_proxy_mode_label(plan.proxy_mode)}{' +节点池' if plan.embedded_proxy_enabled else ''})",
         f"OAuth 输出: {plan.output_dir}",
     ]
+    if plan.provider == "local":
+        lines.insert(8, f"本地同时过码: {plan.local_turnstile_max_inflight}")
     if plan.run_mode == RUN_MODE_REGISTER_SSO:
         lines.append(
             f"SSO转换重试: {plan.sso_convert_retries} 次 / 冷却 {plan.sso_convert_cooldown}s"
@@ -2725,15 +2734,11 @@ class BatchRunner:
         try:
             log_handle = worker.log_path.open("w", encoding="utf-8", buffering=1)
             child_env = os.environ.copy()
-            try:
-                cfg_for_env = _read_config(self.plan.config_path)
-            except Exception:
-                cfg_for_env = {}
-            try:
-                inflight = resolve_local_turnstile_max_inflight_cfg(cfg_for_env, strict=False)
-            except Exception:
-                inflight = 2
-            child_env["XAI_LOCAL_TURNSTILE_MAX_INFLIGHT"] = str(max(1, min(12, int(inflight))))
+            # Freeze the browser-slot limit in the run plan. This avoids a config
+            # read for every spawned account and prevents mid-run UI saves from
+            # giving different workers different admission limits.
+            inflight = int(self.plan.local_turnstile_max_inflight or DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT)
+            child_env["XAI_LOCAL_TURNSTILE_MAX_INFLIGHT"] = str(max(1, min(12, inflight)))
             child_env["XAI_CONFIG_PATH"] = str(self.plan.config_path)
             child_env["XAI_MAIL_CONFIG"] = str(self.plan.config_path)
             process = subprocess.Popen(
@@ -5896,4 +5901,3 @@ class BatchService:
             return
         runner.tick()
         self._sync_logs()
-
