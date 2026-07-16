@@ -13,22 +13,35 @@ from fastapi.testclient import TestClient
 
 
 class ProxySubscriptionParseTests(unittest.TestCase):
+    def test_fetch_plain_hostport_list_is_not_misdetected_as_base64(self):
+        payload = b"159.253.120.61:3128\n167.71.233.240:3129\n"
+        with mock.patch.object(sub, "urlopen") as mocked_open:
+            mocked_open.return_value.__enter__.return_value.read.return_value = payload
+            body, kind = sub.fetch_subscription_body("https://example.test/proxies.txt")
+
+        self.assertEqual(kind, "plain")
+        self.assertEqual(body.splitlines(), ["159.253.120.61:3128", "167.71.233.240:3129"])
+
     def test_parse_http_and_hostport_lines(self):
         nodes = sub.parse_subscription_text(
             "\n".join(
                 [
                     "http://user:pass@1.2.3.4:8080",
                     "5.6.7.8:1000:u:p",
+                    "6.7.8.9:3128",
                     "socks5://u:p@9.9.9.9:1080",
                 ]
             )
         )
-        self.assertEqual(len(nodes), 3)
+        self.assertEqual(len(nodes), 4)
         self.assertTrue(nodes[0].usable_http)
         self.assertEqual(nodes[0].pool_line, "1.2.3.4:8080:user:pass")
         self.assertTrue(nodes[1].usable_http)
         self.assertEqual(nodes[1].pool_line, "5.6.7.8:1000:u:p")
-        self.assertFalse(nodes[2].usable_http)
+        self.assertTrue(nodes[2].usable_http)
+        self.assertEqual(nodes[2].pool_line, "http://6.7.8.9:3128")
+        self.assertFalse(nodes[3].usable_http)
+        self.assertIsNone(sub.parse_share_link("mixed-port: 7890"))
 
     def test_parse_vless_not_usable(self):
         node = sub.parse_share_link(

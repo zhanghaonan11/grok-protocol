@@ -45,8 +45,12 @@
   "local_turnstile_max_workers": 3,
   "local_turnstile_max_inflight": 3,
   "submit_workers": 4,
-  "proxy_subscription_url": "",
-  "proxy_subscription_urls": [],
+  "proxy_subscription_url": "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/main/proxies/protocols/https/data.txt",
+  "proxy_subscription_urls": [
+    "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/main/proxies/protocols/https/data.txt",
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/https.txt",
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/https.txt"
+  ],
   "proxy_subscription_local_http": "",
   "embedded_proxy_enabled": false,
   "embedded_proxy_binary": "",

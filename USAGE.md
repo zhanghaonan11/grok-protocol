@@ -126,6 +126,18 @@ cp config.example.json config.json
 | `proxy_random` | 是否随机选代理 |
 | `proxy_parent` | 父代理，如本地 Clash `http://127.0.0.1:7890`（先 CONNECT 再上认证代理） |
 | `local_proxy_port` | 本机无认证转发端口（浏览器流常用） |
+| `proxy_pool_source` | `manual` 手动维护；`subscription` 从订阅链接刷新 |
+| `proxy_subscription_urls` | 订阅链接数组；也可在 WebUI 中每行填写一个 URL |
+
+`config.example.json` 预置了 3 个持续更新的 GitHub 免费 HTTPS/CONNECT 代理列表：
+
+- [ProxyScrape/free-proxy-list](https://github.com/ProxyScrape/free-proxy-list)（MIT，约每 5 分钟更新）
+- [vakhov/fresh-proxy-list](https://github.com/vakhov/fresh-proxy-list)（MIT，约每 5–20 分钟更新）
+- [iplocate/free-proxy-list](https://github.com/iplocate/free-proxy-list)（MIT，约每 30 分钟更新）
+
+使用时在 WebUI「配置中心 → 代理」把池来源切为「订阅导入」，点击「拉取订阅并写入代理池」。程序会合并、去重并写入本地 `proxies.txt`；该运行时文件不会提交到 Git。建议随后点击「测试代理池」，只使用实测可连通的节点。
+
+> 免费公开代理不保证稳定性、隐私或来源可信度。不要用于敏感账号或明文流量，并遵守目标网站条款、当地法律和各代理列表的使用规则。
 
 ### 3.3 Turnstile（HTTP 流）
 

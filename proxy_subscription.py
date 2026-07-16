@@ -6,6 +6,7 @@ Supports:
   - Clash YAML (`proxies:` list) including type=http/socks5/vless/hysteria2/anytls/...
   - http(s)://user:pass@host:port
   - socks5://user:pass@host:port
+  - host:port
   - host:port:user:pass
   - ss:// / vless:// / vmess:// / trojan:// / hy2:// / hysteria2:// / anytls://
     (non-HTTP schemes are inventory / embedded-mihomo candidates; only HTTP
@@ -215,6 +216,18 @@ def fetch_subscription_body(url: str, *, timeout: float = 20.0) -> Tuple[str, st
         or ("\nproxy-groups:" in head and "\nproxies:" in head)
     ):
         return text, "clash-yaml"
+    # A plain IP/domain:port list can consist entirely of characters accepted
+    # by lenient base64 decoders.  Recognize real proxy rows first so those
+    # lists are not decoded into binary-looking garbage.
+    plain_proxy_pattern = re.compile(
+        r"^[A-Za-z0-9._-]+:\d{1,5}(?::[^:\r\n]*:.*)?$"
+    )
+    if any(
+        plain_proxy_pattern.fullmatch(line.strip())
+        for line in text.splitlines()[:50]
+        if line.strip() and not line.lstrip().startswith("#")
+    ):
+        return text, "plain"
     # Many providers return pure base64 without newlines.
     decoded = _safe_b64_decode(text)
     if decoded and (
@@ -258,37 +271,50 @@ def parse_share_link(raw: str) -> Optional[ParsedNode]:
     line = str(raw or "").strip()
     if not line or line.startswith("#"):
         return None
-    # host:port:user:pass
+    # host:port or host:port:user:pass
     # Strict: avoid Clash YAML list/group lines being misread as proxies.
-    if "://" not in line and not line.lstrip().startswith("-") and line.count(":") >= 3:
+    if "://" not in line and not line.lstrip().startswith("-"):
         parts = line.split(":")
-        host, port_s, user = parts[0].strip(), parts[1].strip(), parts[2]
-        password = ":".join(parts[3:])
-        if (
-            host
-            and " " not in host
-            and not host.startswith("#")
-            and re.fullmatch(r"\d{1,5}", port_s or "")
-            and re.fullmatch(r"[A-Za-z0-9._\[\]-]+", host)
-        ):
-            try:
-                port = int(port_s)
-            except ValueError:
-                port = 0
-            if 1 <= port <= 65535:
-                pool = _http_pool_line(host, port, user, password, "http")
-                if pool:
-                    return ParsedNode(
-                        raw=line,
-                        scheme="http",
-                        host=host,
-                        port=port,
-                        username=user,
-                        password=password,
-                        name="",
-                        usable_http=True,
-                        pool_line=pool,
-                    )
+        if len(parts) == 2 or len(parts) >= 4:
+            host, port_s = parts[0].strip(), parts[1].strip()
+            has_auth = len(parts) >= 4
+            user = parts[2] if has_auth else ""
+            password = ":".join(parts[3:]) if has_auth else ""
+            # Bare host:port entries should look like an actual address.  This
+            # keeps Clash YAML keys such as `mixed-port: 7890` from becoming
+            # fake proxy nodes when PyYAML is unavailable.
+            host_looks_addressable = (
+                has_auth
+                or host.lower() == "localhost"
+                or "." in host
+                or bool(re.fullmatch(r"\[[0-9A-Fa-f:]+\]", host))
+            )
+            if (
+                host
+                and host_looks_addressable
+                and " " not in host
+                and not host.startswith("#")
+                and re.fullmatch(r"\d{1,5}", port_s or "")
+                and re.fullmatch(r"[A-Za-z0-9._\[\]-]+", host)
+            ):
+                try:
+                    port = int(port_s)
+                except ValueError:
+                    port = 0
+                if 1 <= port <= 65535:
+                    pool = _http_pool_line(host, port, user, password, "http")
+                    if pool:
+                        return ParsedNode(
+                            raw=line,
+                            scheme="http",
+                            host=host,
+                            port=port,
+                            username=user,
+                            password=password,
+                            name="",
+                            usable_http=True,
+                            pool_line=pool,
+                        )
 
     lower = line.lower()
     name = _node_name_from_fragment(line)
